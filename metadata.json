@@ -1,0 +1,6 @@
+{
+  "name": "CJN - Comité Juvenil Regional | Campamento y Olimpiadas 2026",
+  "description": "Plataforma oficial del Comité Juvenil Regional (CJN) de la Unión Cristiana Evangélica. Inscripciones para las 31 Regionales, talleres con cupos en tiempo real, olimpiadas bíblicas y deportivas, cupones de grupo, pasarela QR y asignación de tribus.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
