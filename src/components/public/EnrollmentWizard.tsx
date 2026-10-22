@@ -1,51 +1,68 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useCamp } from '../../context/CampContext';
 import { useAuth } from '../../context/AuthContext';
-import { CampCourse, CJRRegional } from '../../types/camp';
-import { CJR_REGIONALES, INITIAL_CHAMPIONSHIPS } from '../../data/initialData';
-import { buildCamperQrPayload, generateQrDataUrl } from '../../utils/qrGenerator';
-import { CJNLogo } from '../common/CJNLogo';
+import { useToast } from '../common/Toast';
+import { CamperRegistration, CampCourse, Championship, Gender } from '../../types/camp';
+import { registrationsApi, type NewRegistrationPayload } from '../../api/services';
+import { errorMessage, isApiError } from '../../api/errors';
+import { generateQrDataUrl } from '../../utils/qrGenerator';
+import { formatCourseScheduleShort, formatDateRange, getCampPhase, isCampEnrollable, PHASE_META } from '../../utils/campUtils';
+import { Credential } from '../common/Credential';
+import { PasswordChecklist, PasswordInput, passwordProblem } from '../auth/PasswordPolicy';
 import confetti from 'canvas-confetti';
-import { 
-  User, 
-  BookOpen, 
-  CreditCard, 
-  CheckCircle2, 
-  AlertTriangle, 
-  ArrowRight, 
-  ArrowLeft, 
-  QrCode, 
-  Tag, 
-  MapPin, 
-  RefreshCw, 
-  Banknote, 
-  Sparkles, 
-  Phone, 
-  Check, 
-  X, 
-  ShieldAlert, 
-  ShieldCheck, 
-  Lock, 
-  Church, 
-  HeartHandshake,
-  Download,
+import {
   AlertCircle,
+  AlertTriangle,
+  ArrowLeft,
+  ArrowRight,
+  Banknote,
+  BookOpen,
+  Building2,
+  CalendarDays,
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  ChevronUp,
+  Church,
+  Clock,
+  Copy,
+  CreditCard,
+  Flame,
+  Hourglass,
+  Info,
+  KeyRound,
+  Loader2,
+  LogIn,
+  Mail,
+  MapPin,
+  PartyPopper,
+  Phone,
+  QrCode,
+  RefreshCw,
+  ShieldCheck,
+  Sparkles,
+  Sun,
+  Tag,
+  Tent,
+  Ticket,
   Trophy,
-  Radio,
-  Zap,
-  Activity,
-  Layers,
-  CheckSquare,
-  Square
+  Upload,
+  User,
+  UserCheck,
+  Users,
+  Wallet,
+  X,
 } from 'lucide-react';
+import { EMAIL_RE, PHONE_RE, localPhone } from '../../utils/validation';
 
 interface EnrollmentWizardProps {
+  /** Taller que el joven estaba mirando: solo se resalta en la vista previa (se elige después de pagar). */
   initialCourseId?: string;
+  /** Campeonato que el joven estaba mirando: solo se resalta en la vista previa. */
   initialChampionshipId?: string;
   onEnrollmentComplete?: () => void;
 }
 
-// 9 Departamentos para expedición de CI en Bolivia
 const CI_EXPEDICIONES = [
   { code: 'LP', name: 'La Paz' },
   { code: 'CB', name: 'Cochabamba' },
@@ -58,165 +75,487 @@ const CI_EXPEDICIONES = [
   { code: 'PA', name: 'Pando' },
 ];
 
-// Áreas de Servicio / Ministerio de Interés
-export const AREAS_DE_SERVICIO = [
-  'Alabanza y Adoración Musical (Voz / Instrumentos)',
-  'Medios Audiovisuales, Fotografía y Transmisión en Vivo',
-  'Protocolo, Ujieres y Recepción de Delegaciones',
-  'Cocina, Comedor y Preparación de Refrigerios',
-  'Primeros Auxilios y Brigada de Salud / Emergencias',
-  'Logística, Montaje de Escenario y Mantenimiento',
-  'Oración, Intercesión y Consejería Espiritual',
-  'Deportes, Árbitros y Dinámicas de Recreación',
-  'Participante General (Capacitación y Discipulado)',
+type PaymentMethodId = 'qr_bank' | 'transfer' | 'cash_box';
+
+const METHOD_STYLE: Record<PaymentMethodId, { icon: React.ElementType; gradient: string }> = {
+  qr_bank: { icon: QrCode, gradient: 'from-sky-500 to-blue-600' },
+  transfer: { icon: Building2, gradient: 'from-indigo-500 to-violet-600' },
+  cash_box: { icon: Banknote, gradient: 'from-emerald-500 to-teal-600' },
+};
+
+const STEPS = [
+  { num: 1, label: 'Campamento', icon: Tent },
+  { num: 2, label: 'Tus datos', icon: User },
+  { num: 3, label: 'Pago', icon: CreditCard },
+  { num: 4, label: '¡Listo!', icon: PartyPopper },
 ];
 
-export const EnrollmentWizard: React.FC<EnrollmentWizardProps> = ({ 
-  initialCourseId, 
-  initialChampionshipId,
-  onEnrollmentComplete 
-}) => {
-  const { 
-    courses, 
-    addRegistration, 
+/** Mismas reglas que el servidor (las vuelve a validar siempre). */
+const MAX_VOUCHER_BYTES = 1.5 * 1024 * 1024;
+
+/** Orden de los campos del paso 2 (para enfocar el primer error). */
+const STEP2_FIELDS = [
+  'firstName',
+  'paternalLastName',
+  'documentId',
+  'birthDate',
+  'gender',
+  'phone',
+  'regional',
+  'email',
+  'password',
+  'confirmPassword',
+  'acceptTerms',
+] as const;
+
+function computeAge(iso: string): number {
+  if (!iso) return 0;
+  const birth = new Date(`${iso}T00:00:00`);
+  if (Number.isNaN(birth.getTime())) return 0;
+  const today = new Date();
+  let a = today.getFullYear() - birth.getFullYear();
+  const m = today.getMonth() - birth.getMonth();
+  if (m < 0 || (m === 0 && today.getDate() < birth.getDate())) a--;
+  return a > 0 && a < 120 ? a : 0;
+}
+
+function champModeLabel(ch: Championship): string {
+  if (ch.mode !== 'team') return 'Individual';
+  const { minTeamSize: min, maxTeamSize: max } = ch;
+  if (min && max && min !== max) return `Equipos de ${min}–${max}`;
+  if (min || max) return `Equipos de ${min || max}`;
+  return 'Por equipos';
+}
+
+function champFeeLabel(ch: Championship): string {
+  if (!ch.registrationFee) return 'Gratis';
+  return `${ch.registrationFee} Bs ${ch.mode === 'team' ? 'por equipo' : 'por persona'}`;
+}
+
+// =========================================================
+// PIEZAS DE UI
+// =========================================================
+function StepIndicator({ currentStep }: { currentStep: number }) {
+  return (
+    <ol className="flex items-center justify-center py-4" aria-label="Pasos de la inscripción">
+      {STEPS.map((step, idx) => {
+        const Icon = step.icon;
+        const isDone = currentStep > step.num;
+        const isActive = currentStep === step.num;
+        return (
+          <React.Fragment key={step.num}>
+            <li className="flex flex-col items-center gap-1" aria-current={isActive ? 'step' : undefined}>
+              <div
+                className={`w-10 h-10 sm:w-11 sm:h-11 rounded-2xl flex items-center justify-center transition-all duration-500 ${
+                  isDone
+                    ? 'bg-emerald-500 text-white shadow'
+                    : isActive
+                    ? 'bg-gradient-to-br from-sky-500 to-blue-600 text-white shadow-xl scale-110'
+                    : 'bg-white text-slate-400 border border-slate-200'
+                }`}
+              >
+                {isDone ? <Check className="w-5 h-5 animate-check-pop" /> : <Icon className="w-5 h-5" />}
+              </div>
+              <span
+                className={`text-[10px] font-bold ${isActive ? 'text-sky-700' : isDone ? 'text-emerald-600' : 'text-slate-400'} ${
+                  isActive ? '' : 'hidden sm:block'
+                }`}
+              >
+                {step.label}
+              </span>
+            </li>
+            {idx < STEPS.length - 1 && (
+              <li aria-hidden className="flex-1 max-w-20 mx-1 sm:mx-2 h-1 rounded-full overflow-hidden bg-slate-200 -mt-4">
+                <div
+                  className="h-full rounded-full transition-all duration-700 bg-gradient-to-r from-emerald-400 to-sky-500"
+                  style={{ width: currentStep > step.num ? '100%' : '0%' }}
+                />
+              </li>
+            )}
+          </React.Fragment>
+        );
+      })}
+    </ol>
+  );
+}
+
+function Field({
+  label,
+  error,
+  required,
+  htmlFor,
+  hint,
+  children,
+}: {
+  label: string;
+  error?: string;
+  required?: boolean;
+  htmlFor?: string;
+  hint?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="space-y-1 min-w-0">
+      <label htmlFor={htmlFor} className="block text-xs sm:text-sm font-bold text-slate-700">
+        {label}
+        {required && <span className="text-sky-500 ml-0.5">*</span>}
+      </label>
+      {children}
+      {error ? (
+        <p id={htmlFor ? `${htmlFor}-error` : undefined} className="text-[11px] text-red-600 font-semibold flex items-start gap-1 animate-fade-in">
+          <AlertCircle className="w-3 h-3 shrink-0 mt-px" /> {error}
+        </p>
+      ) : hint ? (
+        <p className="text-[11px] text-slate-400">{hint}</p>
+      ) : null}
+    </div>
+  );
+}
+
+const controlCls = (error?: string) =>
+  `w-full px-4 py-3 rounded-2xl border text-sm font-medium outline-none transition-all ${
+    error
+      ? 'border-red-300 bg-red-50/40 focus:ring-2 focus:ring-red-300 text-red-900'
+      : 'border-slate-200 bg-slate-50 focus:bg-white focus:border-sky-400 focus:ring-2 focus:ring-sky-100 text-slate-900'
+  }`;
+
+function Input({ error, className = '', ...props }: React.InputHTMLAttributes<HTMLInputElement> & { error?: string }) {
+  return (
+    <input
+      {...props}
+      aria-invalid={error ? true : undefined}
+      aria-describedby={error && props.id ? `${props.id}-error` : undefined}
+      className={`${controlCls(error)} ${className}`}
+    />
+  );
+}
+
+function Select({ error, className = '', ...props }: React.SelectHTMLAttributes<HTMLSelectElement> & { error?: string }) {
+  return (
+    <select
+      {...props}
+      aria-invalid={error ? true : undefined}
+      className={`${controlCls(error)} appearance-none cursor-pointer ${className}`}
+    />
+  );
+}
+
+function SectionTitle({ icon: Icon, title, subtitle, tone = 'sky' }: { icon: React.ElementType; title: string; subtitle?: string; tone?: 'sky' | 'violet' | 'amber' | 'emerald' }) {
+  const toneCls = {
+    sky: 'bg-sky-100 text-sky-600',
+    violet: 'bg-violet-100 text-violet-600',
+    amber: 'bg-amber-100 text-amber-600',
+    emerald: 'bg-emerald-100 text-emerald-600',
+  }[tone];
+  return (
+    <div className="flex items-center gap-2.5">
+      <span className={`w-8 h-8 rounded-xl flex items-center justify-center shrink-0 ${toneCls}`}>
+        <Icon className="w-4 h-4" />
+      </span>
+      <div className="min-w-0">
+        <h3 className="text-sm font-black text-slate-900 font-display leading-tight">{title}</h3>
+        {subtitle && <p className="text-[11px] text-slate-500 leading-snug">{subtitle}</p>}
+      </div>
+    </div>
+  );
+}
+
+function StepCard({
+  title,
+  subtitle,
+  icon: Icon,
+  gradient,
+  onBack,
+  children,
+}: {
+  title: string;
+  subtitle: string;
+  icon: React.ElementType;
+  gradient: string;
+  onBack?: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="bg-white rounded-3xl shadow-xl border border-slate-100 overflow-hidden animate-fade-in-scale mt-4">
+      <div className={`bg-gradient-to-r ${gradient} p-5 sm:p-6`}>
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-10 h-10 bg-white/20 rounded-2xl flex items-center justify-center shrink-0">
+              <Icon className="w-5 h-5 text-white" />
+            </div>
+            <div className="min-w-0">
+              <h2 className="text-lg font-black text-white font-display">{title}</h2>
+              <p className="text-white/80 text-xs truncate">{subtitle}</p>
+            </div>
+          </div>
+          {onBack && (
+            <button
+              type="button"
+              onClick={onBack}
+              className="text-white/85 hover:text-white flex items-center gap-1 text-xs font-bold cursor-pointer shrink-0"
+            >
+              <ArrowLeft className="w-4 h-4" /> Volver
+            </button>
+          )}
+        </div>
+      </div>
+      <div className="p-5 sm:p-8 space-y-6">{children}</div>
+    </div>
+  );
+}
+
+// =========================================================
+// COMPONENTE PRINCIPAL
+// =========================================================
+export const EnrollmentWizard: React.FC<EnrollmentWizardProps> = ({ initialCourseId, initialChampionshipId, onEnrollmentComplete }) => {
+  const {
+    camps,
+    catalogs,
+    courses,
+    championships,
+    selectedCamp,
+    setSelectedCampId,
+    getCoursesForCamp,
     validateGroupCoupon,
     setSelectedCamperForBadge,
-    getTribeById 
+    myRegistrations,
+    setActiveTab,
+    paymentSettings,
+    refreshData,
   } = useCamp();
+  const { currentUser, isAuthenticated, requireLogin, applySession } = useAuth();
+  const { toast, toastError } = useToast();
 
-  const { currentUser } = useAuth();
+  const camp = selectedCamp;
+  const [step, setStep] = useState(1);
+  const goTo = (n: number) => {
+    setStep(n);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
 
-  // Flujo en 4 pasos claros: 1. Datos & Delegado -> 2. Talleres (Precio Fijo) -> 3. Pago (Webhook QR / Efectivo con Adelanto) -> 4. Gafete
-  const [step, setStep] = useState<number>(1);
+  const enrollableCamps = camps.filter(isCampEnrollable).sort((a, b) => a.startDate.localeCompare(b.startDate));
+  const existingReg = camp ? myRegistrations.find((r) => r.campId === camp.id) : undefined;
+  const phase = camp ? getCampPhase(camp) : null;
 
-  // Paso 1: Datos de Registro y Validación
-  const [firstName, setFirstName] = useState(currentUser?.firstName || 'Carlos Daniel');
-  const [paternalLastName, setPaternalLastName] = useState(currentUser?.paternalLastName || 'Condori');
-  const [maternalLastName, setMaternalLastName] = useState(currentUser?.maternalLastName || 'Flores');
-  const [documentNumber, setDocumentNumber] = useState('718290');
-  const [idExpedition, setIdExpedition] = useState('PT');
-  const [birthDate, setBirthDate] = useState(currentUser?.birthDate || '2006-08-15');
-  const [age, setAge] = useState<number>(currentUser?.age || 20);
-  const [phone, setPhone] = useState(currentUser?.phone || '76249155');
-  const [email, setEmail] = useState(currentUser?.email || 'carlos.condori@cjn.bo');
-  const [regional, setRegional] = useState<CJRRegional>(currentUser?.regional || 'POTOSI');
-  const [churchCongregation, setChurchCongregation] = useState('Iglesia Central UCE Potosí');
-  const [serviceAreaOfInterest, setServiceAreaOfInterest] = useState<string>(AREAS_DE_SERVICIO[0]);
-  const [emergencyContactName, setEmergencyContactName] = useState('Pr. Pedro Flores (Líder Delegación)');
-  const [emergencyPhone, setEmergencyPhone] = useState('71890123');
+  // ── PASO 1: VISTA PREVIA (solo lectura) ────────────────
+  const campCourses = useMemo(
+    () =>
+      [...getCoursesForCamp(camp?.id)].sort((a, b) =>
+        a.scheduleType === b.scheduleType
+          ? (a.date || '').localeCompare(b.date || '') || a.startTime.localeCompare(b.startTime)
+          : a.scheduleType === 'all_days'
+          ? -1
+          : 1
+      ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [courses, camp?.id]
+  );
+  const campChamps = useMemo(() => championships.filter((ch) => ch.campId === camp?.id), [championships, camp?.id]);
+  const [showAllCourses, setShowAllCourses] = useState(false);
+  const [showAllChamps, setShowAllChamps] = useState(false);
+  // El taller/campeonato que el joven estaba mirando se muestra primero y resaltado
+  const coursesPreview = useMemo(() => {
+    const list = [...campCourses];
+    const i = list.findIndex((c) => c.id === initialCourseId);
+    if (i > 0) list.unshift(...list.splice(i, 1));
+    return list;
+  }, [campCourses, initialCourseId]);
+  const champsPreview = useMemo(() => {
+    const list = [...campChamps];
+    const i = list.findIndex((c) => c.id === initialChampionshipId);
+    if (i > 0) list.unshift(...list.splice(i, 1));
+    return list;
+  }, [campChamps, initialChampionshipId]);
 
-  // Rol de Delegado & Competencias Deportivas/Olimpiadas
-  const [isDelegate, setIsDelegate] = useState<boolean>(false);
-  const [selectedChampionshipIds, setSelectedChampionshipIds] = useState<string[]>(() => {
-    return initialChampionshipId ? [initialChampionshipId] : [];
-  });
+  // ── PASO 2: DATOS ──────────────────────────────────────
+  const [firstName, setFirstName] = useState(currentUser?.firstName || '');
+  const [paternalLastName, setPaternalLastName] = useState(currentUser?.paternalLastName || '');
+  const [maternalLastName, setMaternalLastName] = useState(currentUser?.maternalLastName || '');
+  const [documentNumber, setDocumentNumber] = useState(currentUser?.documentId?.split('-')[0] || '');
+  const [idExpedition, setIdExpedition] = useState(currentUser?.idExpedition || 'CB');
+  const [birthDate, setBirthDate] = useState(currentUser?.birthDate || '');
+  const [gender, setGender] = useState<Gender | ''>(currentUser?.gender || '');
+  const [phone, setPhone] = useState(localPhone(currentUser?.phone));
+  const [churchCongregation, setChurchCongregation] = useState(currentUser?.churchCongregation || '');
+  const [serviceAreaOfInterest, setServiceAreaOfInterest] = useState(
+    currentUser?.serviceAreaOfInterest || catalogs.serviceAreas[0]?.name || ''
+  );
+  const [emergencyContactName, setEmergencyContactName] = useState('');
+  const [emergencyPhone, setEmergencyPhone] = useState('');
+  const age = computeAge(birthDate);
 
-  // Estado de validación con errores
+  // Cuenta nueva (solo sin sesión): se crea junto con la inscripción
+  const [accountEmail, setAccountEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [acceptTerms, setAcceptTerms] = useState(false);
+  const [emailExists, setEmailExists] = useState(false);
+
   const [errors, setErrors] = useState<Record<string, string>>({});
-
-  // Sincronizar si usuario cambia
-  useEffect(() => {
-    if (currentUser) {
-      setFirstName(currentUser.firstName);
-      setPaternalLastName(currentUser.paternalLastName);
-      setMaternalLastName(currentUser.maternalLastName || '');
-      setAge(currentUser.age);
-      setPhone(currentUser.phone.replace('+591 ', ''));
-      setEmail(currentUser.email);
-      setRegional(currentUser.regional);
-      if (currentUser.churchCongregation) setChurchCongregation(currentUser.churchCongregation);
-      if (currentUser.serviceAreaOfInterest) setServiceAreaOfInterest(currentUser.serviceAreaOfInterest);
-    }
-  }, [currentUser]);
-
-  // Calcular edad automáticamente cuando cambia la fecha de nacimiento
-  const handleBirthDateChange = (val: string) => {
-    setBirthDate(val);
-    if (val) {
-      const birth = new Date(val);
-      const today = new Date();
-      let calculatedAge = today.getFullYear() - birth.getFullYear();
-      const monthDiff = today.getMonth() - birth.getMonth();
-      if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birth.getDate())) {
-        calculatedAge--;
-      }
-      if (!isNaN(calculatedAge) && calculatedAge > 0) {
-        setAge(calculatedAge);
-      }
-    }
-  };
-
-  // Toggle de Competencia para Delegado
-  const toggleChampionshipSelection = (champId: string) => {
-    setSelectedChampionshipIds((prev) => 
-      prev.includes(champId) ? prev.filter((id) => id !== champId) : [...prev, champId]
-    );
-  };
-
-  // Validación de Paso 1
-  const validateStep1 = (): boolean => {
-    const newErrors: Record<string, string> = {};
-
-    if (!firstName.trim()) {
-      newErrors.firstName = 'Ingresa tus nombres de pila.';
-    }
-    if (!paternalLastName.trim()) {
-      newErrors.paternalLastName = 'Ingresa tu apellido paterno.';
-    }
-    if (!documentNumber.trim() || documentNumber.trim().length < 4) {
-      newErrors.documentNumber = 'Ingresa el número de tu Cédula de Identidad (CI).';
-    }
-    if (!phone.trim() || phone.trim().length < 7) {
-      newErrors.phone = 'Ingresa un número de celular o WhatsApp válido (al menos 7 u 8 dígitos).';
-    }
-    if (!age || age < 12 || age > 45) {
-      newErrors.age = 'La edad debe estar comprendida entre 12 y 45 años.';
-    }
-    if (!regional) {
-      newErrors.regional = 'Selecciona tu Regional Oficial del CJN.';
-    }
-
-    setErrors(newErrors);
-    return Object.keys(newErrors).length === 0;
-  };
-
-  // Paso 2: Selección de Talleres (Sin precio individual - 100% Incluidos)
-  const [selectedCourseIds, setSelectedCourseIds] = useState<string[]>(() => {
-    return [initialCourseId || 'c-101'];
-  });
-
-  const toggleCourseSelection = (courseId: string) => {
-    setSelectedCourseIds((prev) => {
-      if (prev.includes(courseId)) {
-        // Evitar deseleccionar todos (mantener al menos 1 taller elegido)
-        if (prev.length <= 1) return prev;
-        return prev.filter((id) => id !== courseId);
-      } else {
-        // Permite elegir talleres de su preferencia (hasta 2)
-        if (prev.length >= 2) {
-          return [prev[1], courseId];
-        }
-        return [...prev, courseId];
-      }
+  const clearErr = (...keys: string[]) =>
+    setErrors((prev) => {
+      if (!keys.some((k) => prev[k])) return prev;
+      const next = { ...prev };
+      keys.forEach((k) => delete next[k]);
+      return next;
     });
+
+  // Ubicación desde los catálogos: ciudad → sub-directiva → regional
+  const regionalFor = (name?: string) => {
+    const reg = catalogs.regionales.find((r) => r.name === name);
+    const sub = catalogs.subdirectivas.find((s) => s.id === reg?.subdirectivaId);
+    return { reg, sub };
+  };
+  const initialLoc = regionalFor(currentUser?.regional);
+  const [cityId, setCityId] = useState(initialLoc.sub?.cityId || catalogs.cities[0]?.id || '');
+  const [subId, setSubId] = useState(initialLoc.sub?.id || '');
+  const [regionalId, setRegionalId] = useState(initialLoc.reg?.id || '');
+  const locationTouched = useRef(false);
+
+  const subsForCity = catalogs.subdirectivas.filter((s) => s.cityId === cityId);
+  const regsForSub = catalogs.regionales.filter((r) => r.subdirectivaId === subId);
+
+  useEffect(() => {
+    if (!subsForCity.some((s) => s.id === subId)) setSubId(subsForCity[0]?.id || '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cityId]);
+  useEffect(() => {
+    if (!regsForSub.some((r) => r.id === regionalId)) setRegionalId(regsForSub[0]?.id || '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subId]);
+
+  const cityName = catalogs.cities.find((c) => c.id === cityId)?.name || '';
+  const subName = catalogs.subdirectivas.find((s) => s.id === subId)?.name || '';
+  const regionalName = catalogs.regionales.find((r) => r.id === regionalId)?.name || '';
+
+  // Si inicia sesión a mitad del formulario: se conserva lo escrito y se completan solo los campos vacíos
+  const justEnrolled = useRef(false);
+  const prevUserId = useRef(currentUser?.id);
+  useEffect(() => {
+    const prev = prevUserId.current;
+    prevUserId.current = currentUser?.id;
+    if (!currentUser || prev === currentUser.id || justEnrolled.current) return;
+    const keep = (v: string, fallback?: string) => (v.trim() ? v : fallback || '');
+    setFirstName((v) => keep(v, currentUser.firstName));
+    setPaternalLastName((v) => keep(v, currentUser.paternalLastName));
+    setMaternalLastName((v) => keep(v, currentUser.maternalLastName));
+    setBirthDate((v) => keep(v, currentUser.birthDate));
+    setPhone((v) => keep(v, localPhone(currentUser.phone)));
+    setDocumentNumber((v) => keep(v, currentUser.documentId?.split('-')[0]));
+    setChurchCongregation((v) => keep(v, currentUser.churchCongregation));
+    setGender((g) => g || currentUser.gender || '');
+    if (!locationTouched.current) {
+      const loc = regionalFor(currentUser.regional);
+      if (loc.reg && loc.sub) {
+        setCityId(loc.sub.cityId);
+        setSubId(loc.sub.id);
+        setRegionalId(loc.reg.id);
+      }
+    }
+    setEmailExists(false);
+    setPassword('');
+    setConfirmPassword('');
+    clearErr('email', 'password', 'confirmPassword', 'acceptTerms');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUser?.id]);
+
+  const focusField = (key: string) => {
+    window.setTimeout(() => {
+      const el = document.getElementById(`enr-${key}`);
+      if (!el) return;
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el.focus({ preventScroll: true });
+    }, 120);
   };
 
-  // Regla de Cupón de Delegación (Pre-validación en Registro)
-  const [couponCodeInput, setCouponCodeInput] = useState('');
-  const [groupSizeInput] = useState(35); // Requisito estricto oficial de 35
-  const [couponStatus, setCouponStatus] = useState<{
-    applied: boolean;
-    discountedPrice?: number;
-    error?: string;
-  }>({ applied: false });
+  const validateData = (): boolean => {
+    const e: Record<string, string> = {};
+    if (firstName.trim().length < 2) e.firstName = 'Ingresa tus nombres.';
+    if (paternalLastName.trim().length < 2) e.paternalLastName = 'Ingresa tu apellido paterno.';
+    if (documentNumber.replace(/\D/g, '').length < 5) e.documentId = 'Ingresa un número de CI válido (mínimo 5 dígitos).';
+    if (!birthDate || !age) e.birthDate = 'Ingresa tu fecha de nacimiento.';
+    else if (camp && (age < camp.minAge || age > camp.maxAge)) {
+      e.birthDate = `Este campamento es para jóvenes de ${camp.minAge} a ${camp.maxAge} años (tienes ${age}).`;
+    }
+    if (!gender) e.gender = 'Indica si eres varón o mujer.';
+    if (!PHONE_RE.test(phone)) e.phone = 'Número de WhatsApp boliviano de 8 dígitos (empieza con 6 o 7).';
+    if (!regionalName) e.regional = 'Selecciona tu regional.';
+    if (!isAuthenticated) {
+      const mail = accountEmail.trim();
+      if (!EMAIL_RE.test(mail)) e.email = 'Ingresa un correo electrónico válido.';
+      const pwd = passwordProblem(password, mail);
+      if (pwd) e.password = pwd;
+      if (!confirmPassword) e.confirmPassword = 'Repite tu contraseña.';
+      else if (confirmPassword !== password) e.confirmPassword = 'Las contraseñas no coinciden.';
+      if (!acceptTerms) e.acceptTerms = 'Debes aceptar los términos y el uso de tus datos.';
+    }
+    setErrors(e);
+    const first = STEP2_FIELDS.find((k) => e[k]);
+    if (first) focusField(first);
+    return !first;
+  };
 
-  // Paso 3: Método de Pago (QR con Webhook en Tiempo Real o Efectivo con Adelanto)
-  const [paymentOption, setPaymentOption] = useState<'qr_bank' | 'cash_box'>('qr_bank');
-  const [paymentQrDataUrl, setPaymentQrDataUrl] = useState<string>('');
-  
-  // Webhook en Tiempo Real para Pago QR
-  const [isListeningWebhook, setIsListeningWebhook] = useState<boolean>(true);
-  const [webhookReceived, setWebhookReceived] = useState<boolean>(false);
+  // ── CUPÓN ──────────────────────────────────────────────
+  const [couponCodeInput, setCouponCodeInput] = useState('');
+  const [couponStatus, setCouponStatus] = useState<{ applied: boolean; discountedPrice?: number; error?: string }>({ applied: false });
+  const [couponLoading, setCouponLoading] = useState(false);
+
+  // Al cambiar de campamento se limpian el cupón y los avisos
+  useEffect(() => {
+    setCouponStatus({ applied: false });
+    setShowAllCourses(false);
+    setShowAllChamps(false);
+    clearErr('birthDate');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [camp?.id]);
+
+  const handleApplyCoupon = async (codeToTest?: string) => {
+    if (couponLoading) return;
+    const code = (codeToTest ?? couponCodeInput).trim().toUpperCase();
+    if (codeToTest !== undefined) setCouponCodeInput(code);
+    if (!code) {
+      setCouponStatus({ applied: false, error: 'Ingresa un código de cupón.' });
+      return;
+    }
+    setCouponLoading(true);
+    setCouponStatus({ applied: false });
+    try {
+      // La validación la hace el servidor (precio, regional y tamaño de delegación)
+      const result = await validateGroupCoupon(code, 35, regionalName, camp);
+      setCouponStatus(
+        result.valid
+          ? { applied: true, discountedPrice: result.discountedPricePerPerson }
+          : { applied: false, error: result.error || 'Cupón no válido.' }
+      );
+    } finally {
+      setCouponLoading(false);
+    }
+  };
+
+  // ── PASO 3: PAGO ───────────────────────────────────────
+  // paymentSettings llega de la API: mientras es null se muestra un esqueleto en el paso de pago
+  const methodOptions = paymentSettings
+    ? (
+        [
+          { id: 'qr_bank' as const, cfg: paymentSettings.qr },
+          { id: 'transfer' as const, cfg: paymentSettings.transfer },
+          { id: 'cash_box' as const, cfg: paymentSettings.cash },
+        ] as const
+      ).filter((m) => m.cfg.enabled)
+    : [];
+  const activeAccounts = paymentSettings?.transfer.accounts.filter((a) => a.isActive) ?? [];
+  const [paymentMethod, setPaymentMethod] = useState<PaymentMethodId>(methodOptions[0]?.id || 'cash_box');
+  useEffect(() => {
+    if (!methodOptions.some((m) => m.id === paymentMethod) && methodOptions[0]) setPaymentMethod(methodOptions[0].id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paymentSettings]);
+  // QR sin pasarela automática: el joven sube su comprobante y tesorería lo verifica
+  const qrManual = !paymentSettings?.qr.autoConfirm;
+  const needsVoucher = paymentMethod === 'transfer' || (paymentMethod === 'qr_bank' && qrManual);
+  const voucherRequired = paymentMethod === 'transfer' ? paymentSettings?.transfer.requireVoucher ?? true : true;
+  const referenceRequired = paymentMethod === 'transfer' ? paymentSettings?.transfer.requireReference ?? false : false;
+  const [paymentQrDataUrl, setPaymentQrDataUrl] = useState('');
+  const [webhookReceived, setWebhookReceived] = useState(false);
   const [webhookPayloadData, setWebhookPayloadData] = useState<{
     banco: string;
     transaccionId: string;
@@ -224,1461 +563,1442 @@ export const EnrollmentWizard: React.FC<EnrollmentWizardProps> = ({
     hora: string;
     authCode: string;
   } | null>(null);
+  const [transferVoucherFile, setTransferVoucherFile] = useState<File | null>(null);
+  const [transferVoucherPreview, setTransferVoucherPreview] = useState('');
+  const [transferReference, setTransferReference] = useState('');
+  const [copiedField, setCopiedField] = useState('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Pago en Efectivo con Adelanto / Anticipo en Sede
-  const [cashAdvanceOption, setCashAdvanceOption] = useState<'with_advance' | 'at_door'>('with_advance');
-  const [cashAdvanceAmount, setCashAdvanceAmount] = useState<number>(100); // 100 Bs de anticipo para reserva de cupón
+  const regularFee = camp?.price || 0;
+  const couponFee = couponStatus.applied ? couponStatus.discountedPrice ?? regularFee : regularFee;
+  // En caja no aplica ningún descuento
+  const totalToPay = paymentMethod === 'cash_box' ? regularFee : couponFee;
+  const cashAdvanceAmount = paymentSettings?.cash.allowAdvance ? Math.ceil((regularFee * (camp?.cashAdvancePercent ?? 30)) / 100) : 0;
+  const cashRemainingAmount = regularFee - cashAdvanceAmount;
 
-  // Paso 4: Finalización
-  const [completedCamper, setCompletedCamper] = useState<any>(null);
-
-  // TARIFAS OFICIALES: PRECIO FIJO ÚNICO (Talleres incluidos con costo 0 Bs)
-  const STANDARD_BASE_CAMP_FEE = 450; // Bs
-  // Si paga en caja: "SI PAGA ALLÁ NO HAY DESCUENTO NI NADA"
-  const isCashAtDoor = paymentOption === 'cash_box';
-  const effectiveBaseCampFee = (!isCashAtDoor && couponStatus.applied && couponStatus.discountedPrice)
-    ? couponStatus.discountedPrice
-    : STANDARD_BASE_CAMP_FEE;
-
-  // Los talleres NO TIENEN PRECIO EXTRA (costo fijo único)
-  const courseMaterialsFee = 0; 
-  const discountAmount = (!isCashAtDoor && couponStatus.applied) 
-    ? (STANDARD_BASE_CAMP_FEE - effectiveBaseCampFee) 
-    : 0;
-  const finalTotalAmount = effectiveBaseCampFee + courseMaterialsFee;
-
-  // Validar Cupón de Delegación
-  const handleApplyCoupon = (codeToTest?: string) => {
-    const code = (codeToTest !== undefined ? codeToTest : couponCodeInput).trim().toUpperCase();
-    if (codeToTest !== undefined) {
-      setCouponCodeInput(code);
-    }
-
-    if (!code) {
-      setCouponStatus({ applied: false, error: 'Ingresa un código de cupón de delegación.' });
-      return;
-    }
-
-    const result = validateGroupCoupon(code, groupSizeInput, regional);
-    if (result.valid) {
-      setCouponStatus({
-        applied: true,
-        discountedPrice: result.discountedPricePerPerson,
-        error: undefined,
-      });
-    } else {
-      setCouponStatus({
-        applied: false,
-        error: result.error || 'Cupón no válido para las reglas del campamento.',
-      });
-    }
-  };
-
-  const handleRemoveCoupon = () => {
-    setCouponCodeInput('');
-    setCouponStatus({ applied: false, error: undefined });
-  };
-
-  // Generar código QR bancario al abrir el paso de pago
-  useEffect(() => {
-    if (step === 3 && paymentOption === 'qr_bank') {
-      const fullParticipantName = `${firstName.trim()} ${paternalLastName.trim()} ${maternalLastName.trim()}`.trim();
-      const qrPayload = `CJN-PAGO-BNB|REGIONAL:${regional}|MONTO:${finalTotalAmount}BS|PAGADOR:${fullParticipantName}|FOLIO:${Date.now()}`;
-      generateQrDataUrl(qrPayload, '#0284C7').then((url) => {
-        setPaymentQrDataUrl(url);
-      });
-      setIsListeningWebhook(true);
-    }
-  }, [step, paymentOption, finalTotalAmount, regional, firstName, paternalLastName, maternalLastName]);
-
-  // Simulación del Webhook Bancario en Tiempo Real
-  const triggerBankingWebhook = (instant = true) => {
-    const fakeAuth = `AUTH-BNB-${Math.floor(100000 + Math.random() * 900000)}`;
-    const payload = {
-      banco: 'Banco Nacional de Bolivia · Red QR Simple Interbancario',
+  const simulateWebhook = () => {
+    setWebhookPayloadData({
+      banco: 'Banco Nacional de Bolivia · QR Simple',
       transaccionId: `TRX-${Date.now().toString().slice(-6)}`,
-      monto: finalTotalAmount,
+      monto: totalToPay,
       hora: new Date().toLocaleTimeString(),
-      authCode: fakeAuth,
-    };
-
-    setWebhookPayloadData(payload);
+      authCode: `AUTH-BNB-${Math.floor(100000 + Math.random() * 900000)}`,
+    });
     setWebhookReceived(true);
-    setIsListeningWebhook(false);
+    confetti({ particleCount: 80, spread: 70, origin: { y: 0.5 }, colors: ['#0284C7', '#10B981', '#F59E0B'] });
+  };
 
-    confetti({
-      particleCount: 80,
-      spread: 60,
-      origin: { y: 0.6 },
-      colors: ['#0284C7', '#10B981', '#F59E0B'],
+  useEffect(() => {
+    if (step === 3 && paymentMethod === 'qr_bank') {
+      const fullName = `${firstName} ${paternalLastName} ${maternalLastName}`.trim();
+      const payload = `CJN-PAGO|CAMP:${camp?.id}|REGIONAL:${regionalName}|MONTO:${totalToPay}BS|PAGADOR:${fullName}|FOLIO:${Date.now()}`;
+      generateQrDataUrl(payload, '#0284C7').then(setPaymentQrDataUrl);
+      setWebhookReceived(false);
+      setWebhookPayloadData(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, paymentMethod, totalToPay, camp?.id]);
+
+  useEffect(() => {
+    if (step === 3 && paymentMethod === 'qr_bank' && !qrManual && !webhookReceived) {
+      const timer = setTimeout(simulateWebhook, 9000);
+      return () => clearTimeout(timer);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, paymentMethod, webhookReceived]);
+
+  const copyToClipboard = (text: string, field: string) => {
+    navigator.clipboard?.writeText(text).then(() => {
+      setCopiedField(field);
+      setTimeout(() => setCopiedField(''), 2000);
     });
   };
 
-  // Escucha automática simulada tras 8 segundos de visualización del QR
-  useEffect(() => {
-    let timer: NodeJS.Timeout;
-    if (step === 3 && paymentOption === 'qr_bank' && !webhookReceived) {
-      timer = setTimeout(() => {
-        // Notificación automática si el usuario espera
-        triggerBankingWebhook(false);
-      }, 9000);
-    }
-    return () => clearTimeout(timer);
-  }, [step, paymentOption, webhookReceived, finalTotalAmount]);
-
-  // Completar inscripción formal
-  const handleCompleteRegistration = async () => {
-    // Si eligió QR pero el webhook no se ha disparado aún:
-    if (paymentOption === 'qr_bank' && !webhookReceived) {
-      alert('Esperando la confirmación del Webhook bancario. Puedes presionar "Simular Webhook Inmediato" para acreditar en tiempo real.');
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      setErrors((prev) => ({ ...prev, voucher: 'El comprobante debe ser una imagen (JPG o PNG).' }));
       return;
     }
+    if (file.size > MAX_VOUCHER_BYTES) {
+      setErrors((prev) => ({ ...prev, voucher: 'La imagen supera 1,5 MB. Comprímela o toma una captura más liviana.' }));
+      return;
+    }
+    clearErr('voucher');
+    setTransferVoucherFile(file);
+    const reader = new FileReader();
+    reader.onload = (ev) => setTransferVoucherPreview(ev.target?.result as string);
+    reader.readAsDataURL(file);
+  };
 
-    const fullCamperName = `${firstName.trim()} ${paternalLastName.trim()} ${maternalLastName.trim()}`.trim();
-    const tempId = `CMP-2026-${Math.floor(1000 + Math.random() * 9000)}`;
-    const qrPayload = buildCamperQrPayload(tempId, fullCamperName, 't-01');
+  const canProceedPayment = () => {
+    if (!paymentSettings || !methodOptions.some((m) => m.id === paymentMethod)) return false;
+    if (needsVoucher) {
+      return (!voucherRequired || !!transferVoucherFile) && (!referenceRequired || !!transferReference.trim());
+    }
+    if (paymentMethod === 'qr_bank') return webhookReceived;
+    return true;
+  };
 
-    // Regla de ingreso y competencias:
-    // Si pagó por QR validado en tiempo real -> status: active, payment completed, competencias confirmadas!
-    // Si es pago en caja -> status: pending_payment, competencias pendientes hasta liquidar en caja.
-    const isVerifiedPaid = paymentOption === 'qr_bank' && webhookReceived;
+  // ── ENVÍO: cuenta + inscripción en un solo paso ────────
+  const [completedCamper, setCompletedCamper] = useState<CamperRegistration | null>(null);
+  const [createdAccountEmail, setCreatedAccountEmail] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState('');
 
-    const actualAdvance = (isCashAtDoor && cashAdvanceOption === 'with_advance') ? Number(cashAdvanceAmount) : 0;
-    const actualRemaining = isCashAtDoor ? Math.max(0, STANDARD_BASE_CAMP_FEE - actualAdvance) : 0;
+  const handleSubmitError = (e: unknown) => {
+    if (!isApiError(e)) {
+      setSubmitError(errorMessage(e));
+      toastError(e);
+      return;
+    }
+    const mapped: Record<string, string> = {};
+    Object.entries(e.errors || {}).forEach(([k, v]) => {
+      mapped[k === 'age' ? 'birthDate' : k === 'confirm' ? 'confirmPassword' : k] = v;
+    });
+    // Errores del cupón (422 con { code })
+    if (mapped.code) {
+      setCouponStatus({ applied: false, error: mapped.code });
+      delete mapped.code;
+    }
+    const emailTaken = e.status === 409 && !!mapped.email;
+    if (emailTaken) setEmailExists(true);
+    setErrors((prev) => ({ ...prev, ...mapped }));
 
-    const paymentTx = {
-      id: `PAY-${Date.now().toString().slice(-6)}`,
-      registrationId: tempId,
-      camperName: fullCamperName,
-      baseCampFee: effectiveBaseCampFee,
-      coursesFees: 0, // Talleres 100% gratuitos incluidos
-      championshipsFees: 0,
-      discountAmount: isCashAtDoor ? 0 : discountAmount,
-      couponCodeApplied: (!isCashAtDoor && couponStatus.applied) ? couponCodeInput.toUpperCase() : undefined,
-      totalAmount: isCashAtDoor ? STANDARD_BASE_CAMP_FEE : finalTotalAmount,
-      advanceAmount: actualAdvance,
-      remainingBalance: actualRemaining,
-      currency: 'Bs' as const,
-      date: new Date().toISOString(),
-      status: isVerifiedPaid ? ('completed' as const) : ('pending_cash' as const),
-      paymentMethod: paymentOption,
-      webhookReceivedAt: webhookPayloadData ? new Date().toISOString() : undefined,
-      webhookPayload: webhookPayloadData || undefined,
-      verifiedAt: isVerifiedPaid ? new Date().toISOString() : undefined,
-      verifiedBy: isVerifiedPaid ? 'Pasarela Bancaria Webhook Real-Time' : undefined,
-      transactionFolio: isVerifiedPaid
-        ? `BNB-WH-${Math.floor(100000 + Math.random() * 900000)}`
-        : `CAJA-SEDE-${Math.floor(1000 + Math.random() * 9000)}`,
-    };
+    const step2Key = STEP2_FIELDS.find((k) => mapped[k]);
+    if (step2Key) {
+      setSubmitError('');
+      goTo(2);
+      focusField(emailTaken ? 'email-exists' : step2Key);
+      toast({
+        type: 'warning',
+        title: emailTaken ? 'Ya tienes una cuenta' : 'Revisa tus datos',
+        message: emailTaken ? 'Inicia sesión con ese correo y continúa: lo que escribiste se mantiene.' : e.message,
+      });
+      return;
+    }
+    // Errores del pago (voucher / reference / paymentMethod) o generales (409 ya inscrito, 413, 429…)
+    setSubmitError(errorMessage(e));
+    if (e.status === 409) refreshData().catch(() => undefined);
+  };
 
-    const newCamper = await addRegistration({
-      userId: currentUser?.id || `usr-${Date.now()}`,
-      qrPayload,
-      fullName: fullCamperName,
+  const handleCompleteRegistration = async () => {
+    if (!camp || !canProceedPayment() || isSubmitting || existingReg) return;
+    if (!validateData()) {
+      goTo(2);
+      return;
+    }
+    const isCash = paymentMethod === 'cash_box';
+    // Montos, tribu, código de entrada y estado los calcula el servidor: solo se envían los datos y el método
+    const payment: NewRegistrationPayload['payment'] = { method: paymentMethod };
+    if (!isCash && couponStatus.applied && couponCodeInput.trim()) payment.couponCode = couponCodeInput.trim().toUpperCase();
+    if (needsVoucher) {
+      if (transferVoucherPreview) {
+        payment.voucherImageUrl = transferVoucherPreview;
+        payment.voucherFileName = transferVoucherFile?.name;
+      }
+      if (transferReference.trim()) payment.voucherReferenceNumber = transferReference.trim();
+    }
+    if (paymentMethod === 'qr_bank' && !qrManual && webhookReceived) payment.gatewayConfirmed = true;
+
+    const docDigits = documentNumber.trim();
+    const payload: NewRegistrationPayload = {
+      campId: camp.id,
       firstName: firstName.trim(),
       paternalLastName: paternalLastName.trim(),
       maternalLastName: maternalLastName.trim(),
       birthDate,
-      age: Number(age) || 19,
-      documentId: `${documentNumber.trim()}-${idExpedition}`,
+      age,
+      gender: gender as Gender,
+      documentId: `${docDigits}-${idExpedition}`,
       idExpedition,
-      phone: phone.trim(),
-      email: email.trim(),
-      regional,
+      phone: `+591 ${phone}`,
+      city: cityName,
+      regional: regionalName,
+      subdirectivaNumber: subName,
       churchCongregation: churchCongregation.trim(),
-      subdirectivaNumber: 'SUBDIRECTIVA 01',
-      serviceAreaOfInterest: serviceAreaOfInterest || 'Campamentista General',
-      delegateRole: isDelegate ? 'DELEGADO' : 'CAMPAMENTISTA',
-      isDelegate,
-      championshipsStatus: isVerifiedPaid ? 'confirmed' : 'pending_payment',
-      emergencyContactName: emergencyContactName.trim() || 'Titular',
-      emergencyPhone: emergencyPhone.trim() || phone.trim(),
-      enrolledCourseIds: selectedCourseIds,
-      enrolledChampionshipIds: isDelegate ? selectedChampionshipIds : [],
-      groupSize: groupSizeInput,
-      medical: {},
-      payment: paymentTx,
-      status: isVerifiedPaid ? 'active' : 'pending_payment',
-    });
+      serviceAreaOfInterest,
+      emergencyContactName: emergencyContactName.trim(),
+      emergencyPhone: emergencyPhone.trim(),
+      // Talleres y campeonatos NO se eligen al comprar: se habilitan cuando el pago está confirmado
+      enrolledCourseIds: [],
+      enrolledChampionshipIds: [],
+      payment,
+    };
+    if (!isAuthenticated) {
+      payload.account = { email: accountEmail.trim().toLowerCase(), password, acceptTerms };
+    }
 
-    setCompletedCamper(newCamper);
-    setStep(4);
+    setSubmitError('');
+    setIsSubmitting(true);
+    try {
+      // Se llama al servicio directamente para recibir los errores por campo (422 / 409) y marcarlos en el formulario
+      const res = await registrationsApi.enroll(payload);
+      justEnrolled.current = true;
+      setCompletedCamper(res.registration);
+      if (res.user && res.tokens) {
+        // Compra sin sesión: el servidor creó la cuenta → se abre la sesión (las inscripciones se recargan solas)
+        setCreatedAccountEmail(res.user.email);
+        applySession(res.user, res.tokens);
+      } else {
+        refreshData().catch(() => undefined);
+      }
+      setPassword('');
+      setConfirmPassword('');
+      goTo(4);
+      const end = Date.now() + 900;
+      const colors = ['#0284C7', '#10B981', '#F59E0B', '#8B5CF6', '#EC4899'];
+      (function frame() {
+        confetti({ particleCount: 6, angle: 60, spread: 60, origin: { x: 0 }, colors });
+        confetti({ particleCount: 6, angle: 120, spread: 60, origin: { x: 1 }, colors });
+        if (Date.now() < end) requestAnimationFrame(frame);
+      })();
+    } catch (e) {
+      handleSubmitError(e);
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
-  const assignedTribe = completedCamper ? getTribeById(completedCamper.tribeId) : null;
+  const goToMyCamp = (reg: CamperRegistration) => setActiveTab('registration-detail', { id: reg.id });
 
-  return (
-    <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-10 animate-fade-in">
-      
-      {/* Header Compacto y Visual */}
-      <div className="text-center space-y-2 pb-5 border-b border-sky-100">
-        <CJNLogo size="sm" />
-        <h1 className="text-2xl sm:text-3xl font-black text-slate-900 font-display">
-          Inscripción Oficial · Campamento CJN 2026
-        </h1>
-        <p className="text-xs sm:text-sm text-slate-600 max-w-lg mx-auto">
-          Comité Juvenil Nacional · Unión Cristiana Evangélica de Bolivia.
+  // =========================================================
+  // RENDER
+  // =========================================================
+  const voucherBlock = (
+    <div className="space-y-4">
+      <button
+        type="button"
+        id="enr-voucher"
+        onClick={() => fileInputRef.current?.click()}
+        className={`w-full rounded-2xl border-2 border-dashed p-6 text-center cursor-pointer transition-all ${
+          errors.voucher
+            ? 'border-red-300 bg-red-50/50'
+            : transferVoucherPreview
+            ? 'border-indigo-400 bg-indigo-50'
+            : 'border-slate-200 hover:border-indigo-300 hover:bg-indigo-50/50'
+        }`}
+      >
+        {transferVoucherPreview ? (
+          <span className="block space-y-2">
+            <img src={transferVoucherPreview} alt="Comprobante" className="max-h-32 mx-auto rounded-xl object-contain" />
+            <span className="block text-xs text-indigo-700 font-bold break-all">{transferVoucherFile?.name}</span>
+            <span className="block text-[11px] text-indigo-500">Toca para cambiar la imagen</span>
+          </span>
+        ) : (
+          <span className="block space-y-2">
+            <Upload className="w-7 h-7 text-slate-400 mx-auto" />
+            <span className="block text-sm font-bold text-slate-600">
+              Sube la foto de tu comprobante{voucherRequired ? '' : ' (opcional)'}
+            </span>
+            <span className="block text-xs text-slate-400">JPG o PNG · máx. 1,5 MB</span>
+          </span>
+        )}
+      </button>
+      {errors.voucher && (
+        <p className="text-[11px] text-red-600 font-semibold flex items-center gap-1 -mt-2">
+          <AlertCircle className="w-3 h-3 shrink-0" /> {errors.voucher}
         </p>
+      )}
+      <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFileChange} className="hidden" />
+      <Field label="Número de referencia de la transacción" required={referenceRequired} htmlFor="enr-reference" error={errors.reference}>
+        <Input
+          id="enr-reference"
+          value={transferReference}
+          onChange={(e) => {
+            setTransferReference(e.target.value);
+            clearErr('reference');
+          }}
+          error={errors.reference}
+          placeholder="ej. 20261016-123456"
+        />
+      </Field>
+    </div>
+  );
 
-        {/* Barra de 3 Pasos Visual */}
-        <div className="max-w-xs sm:max-w-md mx-auto pt-3">
-          <div className="grid grid-cols-3 gap-2 text-center text-xs font-bold">
-            <div className={`py-2 px-1 rounded-xl transition-all ${
-              step === 1 ? 'bg-[#0284C7] text-white shadow-sm' : step > 1 ? 'bg-sky-100 text-[#0284C7]' : 'bg-slate-100 text-slate-400'
-            }`}>
-              1. Datos & Delegado
-            </div>
-            <div className={`py-2 px-1 rounded-xl transition-all ${
-              step === 2 ? 'bg-[#0284C7] text-white shadow-sm' : step > 2 ? 'bg-sky-100 text-[#0284C7]' : 'bg-slate-100 text-slate-400'
-            }`}>
-              2. Mis Talleres (Fijo)
-            </div>
-            <div className={`py-2 px-1 rounded-xl transition-all ${
-              step >= 3 ? 'bg-[#0284C7] text-white shadow-sm' : 'bg-slate-100 text-slate-400'
-            }`}>
-              3. Pago & Webhook QR
-            </div>
+  const existingRegBanner = existingReg && step < 4 && (
+    <div className="mt-4 p-4 rounded-2xl bg-emerald-50 border border-emerald-200 flex flex-col sm:flex-row sm:items-center gap-3 animate-fade-in">
+      <CheckCircle2 className="w-6 h-6 text-emerald-600 shrink-0" />
+      <div className="flex-1 text-sm text-emerald-900">
+        <strong className="block">Ya estás inscrito en este campamento.</strong>
+        Tu código de entrada es <span className="font-mono font-bold">{existingReg.ticketCode}</span>. Desde «Mi campamento» eliges tus
+        talleres y campeonatos.
+      </div>
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={() => setSelectedCamperForBadge(existingReg)}
+          className="px-3.5 py-2.5 rounded-xl bg-white border border-emerald-200 text-emerald-700 text-xs font-black cursor-pointer"
+        >
+          Credencial
+        </button>
+        <button
+          type="button"
+          onClick={() => goToMyCamp(existingReg)}
+          className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black cursor-pointer inline-flex items-center gap-1.5"
+        >
+          Mi campamento <ArrowRight className="w-3.5 h-3.5" />
+        </button>
+      </div>
+    </div>
+  );
+
+  const buyerBanner = isAuthenticated ? (
+    <div className="flex items-center gap-3 p-3 rounded-2xl bg-sky-50 border border-sky-100">
+      <span className="w-9 h-9 rounded-xl bg-sky-600 text-white flex items-center justify-center shrink-0">
+        <UserCheck className="w-4 h-4" />
+      </span>
+      <div className="min-w-0 text-xs text-sky-900">
+        <span className="block text-[10px] font-black uppercase tracking-wider text-sky-500">Comprando como</span>
+        <span className="font-bold break-all">{currentUser?.email}</span>
+      </div>
+    </div>
+  ) : null;
+
+  const renderCoursePreview = (course: CampCourse) => {
+    const highlighted = course.id === initialCourseId;
+    const full = course.enrolledCount >= course.maxCapacity;
+    return (
+      <li
+        key={course.id}
+        className={`flex items-center gap-3 p-2.5 rounded-2xl border ${
+          highlighted ? 'border-violet-300 bg-violet-50 ring-2 ring-violet-100' : 'border-slate-100 bg-white'
+        }`}
+      >
+        {course.coverImageUrl ? (
+          <img src={course.coverImageUrl} alt="" className="w-11 h-11 rounded-xl object-cover shrink-0" />
+        ) : (
+          <span className="w-11 h-11 rounded-xl bg-violet-100 text-violet-600 flex items-center justify-center shrink-0">
+            <BookOpen className="w-5 h-5" />
+          </span>
+        )}
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs font-black text-slate-900 truncate">{course.title}</span>
+            {highlighted && (
+              <span className="shrink-0 px-1.5 py-0.5 rounded-md bg-violet-600 text-white text-[9px] font-black uppercase">Te interesa</span>
+            )}
+          </div>
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] text-slate-500 font-semibold mt-0.5">
+            <span className="inline-flex items-center gap-1">
+              {course.fullDay ? <Sun className="w-3 h-3 text-amber-500" /> : <Clock className="w-3 h-3" />}
+              {formatCourseScheduleShort(course)}
+            </span>
+            <span className="truncate">{course.instructor}</span>
+            {full && <span className="text-red-600 font-bold">Completo</span>}
           </div>
         </div>
-      </div>
+      </li>
+    );
+  };
 
-      {/* ================= PASO 1: DATOS COMPLETOS + ROL DE DELEGADO & COMPETENCIAS + CUPÓN ================= */}
-      {step === 1 && (
-        <div className="bg-white rounded-3xl p-5 sm:p-8 shadow-xl border border-sky-100 mt-6 space-y-6">
-          <div className="flex items-center justify-between pb-3 border-b border-slate-100">
-            <div className="flex items-center gap-2">
-              <User className="w-5 h-5 text-[#0284C7]" />
-              <h2 className="text-base sm:text-lg font-bold text-slate-900 font-display">
-                Paso 1: Ficha de Registro y Delegación
-              </h2>
-            </div>
-            <span className="text-xs font-bold text-sky-700 bg-sky-50 px-2.5 py-1 rounded-lg border border-sky-200">
-              Campos Obligatorios (*)
-            </span>
+  const renderChampPreview = (ch: Championship) => {
+    const highlighted = ch.id === initialChampionshipId;
+    return (
+      <li
+        key={ch.id}
+        className={`flex items-center gap-3 p-2.5 rounded-2xl border ${
+          highlighted ? 'border-amber-300 bg-amber-50 ring-2 ring-amber-100' : 'border-slate-100 bg-white'
+        }`}
+      >
+        <span className="w-11 h-11 rounded-xl bg-amber-100 text-amber-600 flex items-center justify-center shrink-0">
+          {ch.mode === 'team' ? <Users className="w-5 h-5" /> : <Trophy className="w-5 h-5" />}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs font-black text-slate-900 truncate">{ch.name}</span>
+            {highlighted && (
+              <span className="shrink-0 px-1.5 py-0.5 rounded-md bg-amber-500 text-white text-[9px] font-black uppercase">Te interesa</span>
+            )}
           </div>
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] text-slate-500 font-semibold mt-0.5">
+            <span>{ch.genderCategory}</span>
+            <span>· {champModeLabel(ch)}</span>
+            <span className={ch.registrationFee ? 'text-amber-700' : 'text-emerald-700'}>· {champFeeLabel(ch)}</span>
+          </div>
+        </div>
+      </li>
+    );
+  };
 
-          <div className="space-y-4 text-xs sm:text-sm">
-            {/* Nombres y Apellidos */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <div>
-                <label className="font-bold text-slate-800 block mb-1">
-                  Nombres de Pila *
-                </label>
-                <input
-                  type="text"
-                  value={firstName}
-                  onChange={(e) => setFirstName(e.target.value)}
-                  className={`w-full px-3.5 py-2.5 rounded-xl border bg-slate-50 focus:bg-white focus:ring-2 text-slate-900 text-sm ${
-                    errors.firstName ? 'border-red-400 focus:ring-red-400 bg-red-50/40' : 'border-slate-200 focus:ring-[#0284C7]'
-                  }`}
-                  placeholder="Ej. Carlos Daniel"
-                />
-                {errors.firstName && (
-                  <p className="text-[11px] text-red-600 font-bold mt-1 flex items-center gap-1">
-                    <AlertCircle className="w-3 h-3" /> {errors.firstName}
-                  </p>
-                )}
+  const PREVIEW_LIMIT = 4;
+
+  return (
+    <div className="min-h-screen bg-gradient-to-b from-sky-50 via-white to-slate-50 px-4 sm:px-6 lg:px-8 py-8">
+      <div className="max-w-3xl mx-auto">
+        <div className="text-center mb-2 animate-fade-in-up">
+          <span className="text-[11px] font-black uppercase tracking-widest text-[#0284C7]">Inscripción en línea</span>
+          <h1 className="text-2xl sm:text-3xl font-black font-display text-slate-900 mt-1">{camp ? camp.name : 'Elige tu campamento'}</h1>
+        </div>
+
+        <StepIndicator currentStep={step} />
+
+        {existingRegBanner}
+
+        {/* ── PASO 1: CAMPAMENTO ─────────────────────────── */}
+        {step === 1 && (
+          <StepCard title="Paso 1: Tu campamento" subtitle="Confirma a qué campamento te inscribes" icon={Tent} gradient="from-sky-500 to-blue-600">
+            {camp ? (
+              <div className="rounded-3xl overflow-hidden border border-slate-100">
+                <div className="relative h-44 sm:h-52">
+                  <img src={camp.imageUrl} alt={camp.name} className="w-full h-full object-cover" />
+                  <div className="absolute inset-0 bg-gradient-to-t from-slate-950/90 via-slate-950/20 to-transparent" />
+                  {phase && (
+                    <span
+                      className={`absolute top-3 right-3 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold border ${PHASE_META[phase].className}`}
+                    >
+                      <span className={`w-1.5 h-1.5 rounded-full ${PHASE_META[phase].dot}`} />
+                      {PHASE_META[phase].label}
+                    </span>
+                  )}
+                  <div className="absolute bottom-4 left-5 right-5 text-white">
+                    {camp.theme && <div className="text-[11px] font-bold text-amber-300 uppercase tracking-widest">“{camp.theme}”</div>}
+                    <h3 className="text-xl font-black font-display leading-tight">{camp.name}</h3>
+                  </div>
+                </div>
+                <div className="p-5 grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+                  <div className="flex items-center gap-2 text-slate-700 font-semibold">
+                    <CalendarDays className="w-4 h-4 text-[#0284C7] shrink-0" />
+                    {formatDateRange(camp.startDate, camp.endDate)}
+                  </div>
+                  <div className="flex items-center gap-2 text-slate-700 font-semibold min-w-0">
+                    <MapPin className="w-4 h-4 text-[#0284C7] shrink-0" />
+                    <span className="truncate">{camp.location}</span>
+                  </div>
+                  <div className="flex items-center gap-2 text-slate-700 font-semibold">
+                    <User className="w-4 h-4 text-[#0284C7] shrink-0" />
+                    {camp.minAge} a {camp.maxAge} años
+                  </div>
+                  <p className="sm:col-span-3 text-slate-600 leading-relaxed">{camp.description}</p>
+                  {camp.includes.length > 0 && (
+                    <div className="sm:col-span-3 flex flex-wrap gap-1.5">
+                      {camp.includes.map((inc) => (
+                        <span
+                          key={inc}
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-50 text-emerald-800 font-semibold border border-emerald-100"
+                        >
+                          <Check className="w-3 h-3" /> {inc}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
+            ) : (
+              <p className="text-sm text-slate-500">No hay un campamento seleccionado.</p>
+            )}
 
-              <div>
-                <label className="font-bold text-slate-800 block mb-1">
-                  Apellido Paterno *
-                </label>
-                <input
-                  type="text"
-                  value={paternalLastName}
-                  onChange={(e) => setPaternalLastName(e.target.value)}
-                  className={`w-full px-3.5 py-2.5 rounded-xl border bg-slate-50 focus:bg-white focus:ring-2 text-slate-900 text-sm ${
-                    errors.paternalLastName ? 'border-red-400 focus:ring-red-400 bg-red-50/40' : 'border-slate-200 focus:ring-[#0284C7]'
-                  }`}
-                  placeholder="Ej. Condori"
-                />
-                {errors.paternalLastName && (
-                  <p className="text-[11px] text-red-600 font-bold mt-1 flex items-center gap-1">
-                    <AlertCircle className="w-3 h-3" /> {errors.paternalLastName}
-                  </p>
-                )}
-              </div>
-
-              <div>
-                <label className="font-bold text-slate-700 block mb-1">
-                  Apellido Materno
-                </label>
-                <input
-                  type="text"
-                  value={maternalLastName}
-                  onChange={(e) => setMaternalLastName(e.target.value)}
-                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:ring-2 focus:ring-[#0284C7] text-slate-900 text-sm"
-                  placeholder="Ej. Flores"
-                />
-              </div>
-            </div>
-
-            {/* Cédula de Identidad (CI) con Expedición */}
-            <div className="grid grid-cols-1 sm:grid-cols-12 gap-3">
-              <div className="sm:col-span-8">
-                <label className="font-bold text-slate-800 block mb-1">
-                  Cédula de Identidad (CI) *
-                </label>
-                <input
-                  type="text"
-                  value={documentNumber}
-                  onChange={(e) => setDocumentNumber(e.target.value)}
-                  className={`w-full px-3.5 py-2.5 rounded-xl border bg-slate-50 focus:bg-white focus:ring-2 text-slate-900 text-sm ${
-                    errors.documentNumber ? 'border-red-400 focus:ring-red-400 bg-red-50/40' : 'border-slate-200 focus:ring-[#0284C7]'
-                  }`}
-                  placeholder="Ej. 718290"
-                />
-                {errors.documentNumber && (
-                  <p className="text-[11px] text-red-600 font-bold mt-1 flex items-center gap-1">
-                    <AlertCircle className="w-3 h-3" /> {errors.documentNumber}
-                  </p>
-                )}
-              </div>
-
-              <div className="sm:col-span-4">
-                <label className="font-bold text-slate-800 block mb-1">
-                  Expedido en *
-                </label>
-                <select
-                  value={idExpedition}
-                  onChange={(e) => setIdExpedition(e.target.value)}
-                  className="w-full px-3 py-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:ring-2 focus:ring-[#0284C7] text-slate-900 text-sm font-bold"
-                >
-                  {CI_EXPEDICIONES.map((dep) => (
-                    <option key={dep.code} value={dep.code}>
-                      {dep.code} - {dep.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
-
-            {/* Fecha Nacimiento, Edad y Celular WhatsApp */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <div>
-                <label className="font-bold text-slate-800 block mb-1">
-                  Fecha de Nacimiento *
-                </label>
-                <input
-                  type="date"
-                  value={birthDate}
-                  onChange={(e) => handleBirthDateChange(e.target.value)}
-                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:ring-2 focus:ring-[#0284C7] text-slate-900 text-sm"
-                />
-              </div>
-
-              <div>
-                <label className="font-bold text-slate-800 block mb-1">
-                  Edad (12 a 45 años) *
-                </label>
-                <input
-                  type="number"
-                  min="12"
-                  max="45"
-                  value={age}
-                  onChange={(e) => setAge(Number(e.target.value))}
-                  className={`w-full px-3.5 py-2.5 rounded-xl border bg-slate-50 focus:bg-white focus:ring-2 text-slate-900 text-sm ${
-                    errors.age ? 'border-red-400 focus:ring-red-400 bg-red-50/40' : 'border-slate-200 focus:ring-[#0284C7]'
-                  }`}
-                />
-                {errors.age && (
-                  <p className="text-[11px] text-red-600 font-bold mt-1 flex items-center gap-1">
-                    <AlertCircle className="w-3 h-3" /> {errors.age}
-                  </p>
-                )}
-              </div>
-
-              <div>
-                <label className="font-bold text-slate-800 block mb-1">
-                  Celular / WhatsApp *
-                </label>
+            {enrollableCamps.length > 1 && (
+              <Field label="¿Quieres inscribirte a otro campamento?" htmlFor="enr-camp">
                 <div className="relative">
-                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 font-mono text-xs">
-                    +591
-                  </span>
-                  <input
-                    type="tel"
-                    value={phone}
-                    onChange={(e) => setPhone(e.target.value.replace(/[^0-9]/g, ''))}
-                    className={`w-full pl-13 pr-3.5 py-2.5 rounded-xl border bg-slate-50 focus:bg-white focus:ring-2 text-slate-900 text-sm font-mono ${
-                      errors.phone ? 'border-red-400 focus:ring-red-400 bg-red-50/40' : 'border-slate-200 focus:ring-[#0284C7]'
+                  <Tent className="w-4 h-4 text-slate-400 absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <Select id="enr-camp" value={camp?.id || ''} onChange={(e) => setSelectedCampId(e.target.value)} className="pl-11">
+                    {camp && !enrollableCamps.some((c) => c.id === camp.id) && <option value={camp.id}>{camp.name}</option>}
+                    {enrollableCamps.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.isFeatured ? '★ ' : ''}
+                        {c.name} · {formatDateRange(c.startDate, c.endDate)} · {c.price} Bs
+                      </option>
+                    ))}
+                  </Select>
+                </div>
+              </Field>
+            )}
+
+            {/* Vista previa de talleres y campeonatos (solo lectura) */}
+            {camp && (campCourses.length > 0 || campChamps.length > 0) && (
+              <div className="space-y-4">
+                <div className="flex items-start gap-2.5 p-3.5 rounded-2xl bg-violet-50 border border-violet-100 text-xs text-violet-900">
+                  <Info className="w-4 h-4 text-violet-600 shrink-0 mt-px" />
+                  <p className="leading-relaxed">
+                    <strong>Los talleres y campeonatos los eliges después de confirmar tu pago, desde Mi campamento.</strong> Aquí
+                    puedes ver lo que te espera.
+                  </p>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                  {campCourses.length > 0 && (
+                    <div className="space-y-2.5">
+                      <SectionTitle
+                        icon={BookOpen}
+                        tone="violet"
+                        title={`Talleres (${campCourses.length})`}
+                        subtitle={`Hasta ${camp.maxCoursesPerCamper} por joven · incluidos`}
+                      />
+                      <ul className="space-y-2">
+                        {(showAllCourses ? coursesPreview : coursesPreview.slice(0, PREVIEW_LIMIT)).map(renderCoursePreview)}
+                      </ul>
+                      {campCourses.length > PREVIEW_LIMIT && (
+                        <button
+                          type="button"
+                          onClick={() => setShowAllCourses((v) => !v)}
+                          className="text-[11px] font-black text-violet-700 hover:underline inline-flex items-center gap-1 cursor-pointer"
+                        >
+                          {showAllCourses ? (
+                            <>
+                              Ver menos <ChevronUp className="w-3.5 h-3.5" />
+                            </>
+                          ) : (
+                            <>
+                              Ver los {campCourses.length} talleres <ChevronDown className="w-3.5 h-3.5" />
+                            </>
+                          )}
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  {campChamps.length > 0 && (
+                    <div className="space-y-2.5">
+                      <SectionTitle
+                        icon={Trophy}
+                        tone="amber"
+                        title={`Campeonatos (${campChamps.length})`}
+                        subtitle="Opcionales · algunos tienen un costo extra"
+                      />
+                      <ul className="space-y-2">
+                        {(showAllChamps ? champsPreview : champsPreview.slice(0, PREVIEW_LIMIT)).map(renderChampPreview)}
+                      </ul>
+                      {campChamps.length > PREVIEW_LIMIT && (
+                        <button
+                          type="button"
+                          onClick={() => setShowAllChamps((v) => !v)}
+                          className="text-[11px] font-black text-amber-700 hover:underline inline-flex items-center gap-1 cursor-pointer"
+                        >
+                          {showAllChamps ? (
+                            <>
+                              Ver menos <ChevronUp className="w-3.5 h-3.5" />
+                            </>
+                          ) : (
+                            <>
+                              Ver los {campChamps.length} campeonatos <ChevronDown className="w-3.5 h-3.5" />
+                            </>
+                          )}
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {!existingReg && camp && !isCampEnrollable(camp) && (
+              <div className="p-4 rounded-2xl bg-amber-50 border border-amber-200 text-sm text-amber-900 flex items-start gap-2">
+                <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0" />
+                Las inscripciones para este campamento no están disponibles. Elige otro campamento abierto.
+              </div>
+            )}
+
+            <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-4 border-t border-slate-100">
+              <div className="text-center sm:text-left">
+                <span className="text-xs text-slate-500">Inversión</span>
+                <div className="text-3xl font-black font-mono text-sky-600">{regularFee} Bs</div>
+                {camp?.groupPrice !== undefined && (
+                  <span className="text-[11px] text-amber-700 font-semibold">{camp.groupPrice} Bs con cupón de delegación</span>
+                )}
+              </div>
+              <button
+                type="button"
+                disabled={!camp || !!existingReg || !isCampEnrollable(camp)}
+                onClick={() => goTo(2)}
+                className="w-full sm:w-auto px-8 py-4 bg-gradient-to-r from-sky-500 to-blue-600 text-white font-black text-sm rounded-2xl shadow-lg flex items-center justify-center gap-2 active:scale-95 cursor-pointer disabled:from-slate-200 disabled:to-slate-200 disabled:text-slate-400 disabled:shadow-none disabled:cursor-not-allowed"
+              >
+                Continuar <ArrowRight className="w-4 h-4" />
+              </button>
+            </div>
+          </StepCard>
+        )}
+
+        {/* ── PASO 2: DATOS ──────────────────────────────── */}
+        {step === 2 && (
+          <StepCard
+            title="Paso 2: Tus datos"
+            subtitle={isAuthenticated ? 'Revisa y completa tu información' : 'Tus datos y tu cuenta, en un solo paso'}
+            icon={User}
+            gradient="from-sky-500 to-blue-600"
+            onBack={() => goTo(1)}
+          >
+            {isAuthenticated ? (
+              buyerBanner
+            ) : (
+              <div className="flex flex-col sm:flex-row sm:items-center gap-3 p-3.5 rounded-2xl bg-sky-50 border border-sky-100 text-xs text-sky-900">
+                <Sparkles className="w-5 h-5 text-sky-600 shrink-0" />
+                <p className="flex-1 leading-relaxed">
+                  <strong>No necesitas registrarte antes.</strong> Con estos datos creamos tu cuenta al confirmar la inscripción.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => requireLogin('login')}
+                  className="self-start sm:self-auto inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white border border-sky-200 text-sky-700 font-black cursor-pointer hover:bg-sky-100"
+                >
+                  <LogIn className="w-3.5 h-3.5" /> Ya tengo cuenta
+                </button>
+              </div>
+            )}
+
+            {/* Datos personales */}
+            <div className="space-y-4">
+              <SectionTitle icon={User} title="Datos personales" subtitle="Tal como figuran en tu carnet" />
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <Field label="Nombres" required error={errors.firstName} htmlFor="enr-firstName">
+                  <Input
+                    id="enr-firstName"
+                    autoComplete="given-name"
+                    value={firstName}
+                    onChange={(e) => {
+                      setFirstName(e.target.value);
+                      clearErr('firstName');
+                    }}
+                    error={errors.firstName}
+                    placeholder="Carlos Daniel"
+                  />
+                </Field>
+                <Field label="Apellido paterno" required error={errors.paternalLastName} htmlFor="enr-paternalLastName">
+                  <Input
+                    id="enr-paternalLastName"
+                    autoComplete="family-name"
+                    value={paternalLastName}
+                    onChange={(e) => {
+                      setPaternalLastName(e.target.value);
+                      clearErr('paternalLastName');
+                    }}
+                    error={errors.paternalLastName}
+                    placeholder="Condori"
+                  />
+                </Field>
+                <Field label="Apellido materno" htmlFor="enr-maternalLastName">
+                  <Input
+                    id="enr-maternalLastName"
+                    value={maternalLastName}
+                    onChange={(e) => setMaternalLastName(e.target.value)}
+                    placeholder="Flores"
+                  />
+                </Field>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div className="sm:col-span-2">
+                  <Field label="Cédula de identidad (CI)" required error={errors.documentId} htmlFor="enr-documentId">
+                    <Input
+                      id="enr-documentId"
+                      inputMode="numeric"
+                      value={documentNumber}
+                      onChange={(e) => {
+                        setDocumentNumber(e.target.value.replace(/[^\dA-Za-z]/g, '').slice(0, 15));
+                        clearErr('documentId');
+                      }}
+                      error={errors.documentId}
+                      placeholder="ej. 7182904"
+                    />
+                  </Field>
+                </div>
+                <Field label="Expedido en" htmlFor="enr-idExpedition">
+                  <Select id="enr-idExpedition" value={idExpedition} onChange={(e) => setIdExpedition(e.target.value)}>
+                    {CI_EXPEDICIONES.map((d) => (
+                      <option key={d.code} value={d.code}>
+                        {d.code} — {d.name}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <Field
+                  label="Fecha de nacimiento"
+                  required
+                  error={errors.birthDate}
+                  htmlFor="enr-birthDate"
+                  hint={age ? `Tienes ${age} años` : camp ? `Para jóvenes de ${camp.minAge} a ${camp.maxAge} años` : undefined}
+                >
+                  <Input
+                    id="enr-birthDate"
+                    type="date"
+                    autoComplete="bday"
+                    value={birthDate}
+                    max={new Date().toISOString().slice(0, 10)}
+                    onChange={(e) => {
+                      setBirthDate(e.target.value);
+                      clearErr('birthDate');
+                    }}
+                    error={errors.birthDate}
+                  />
+                </Field>
+                <Field
+                  label="Sexo"
+                  required
+                  error={errors.gender}
+                  htmlFor="enr-gender"
+                  hint="Para las categorías Varonil y Femenil de los campeonatos"
+                >
+                  <div
+                    id="enr-gender"
+                    role="radiogroup"
+                    aria-label="Sexo"
+                    aria-invalid={errors.gender ? true : undefined}
+                    tabIndex={-1}
+                    className={`grid grid-cols-2 gap-1 p-1 rounded-2xl border outline-none ${
+                      errors.gender ? 'border-red-300 bg-red-50/40' : 'border-slate-200 bg-slate-50'
                     }`}
+                  >
+                    {(
+                      [
+                        { v: 'M', label: 'Varón', active: 'bg-sky-600 text-white shadow' },
+                        { v: 'F', label: 'Mujer', active: 'bg-pink-500 text-white shadow' },
+                      ] as const
+                    ).map((o) => (
+                      <button
+                        key={o.v}
+                        type="button"
+                        role="radio"
+                        aria-checked={gender === o.v}
+                        onClick={() => {
+                          setGender(o.v);
+                          clearErr('gender');
+                        }}
+                        className={`py-2.5 rounded-xl text-sm font-black transition-all cursor-pointer ${
+                          gender === o.v ? o.active : 'text-slate-600 hover:bg-white'
+                        }`}
+                      >
+                        {o.label}
+                      </button>
+                    ))}
+                  </div>
+                </Field>
+              </div>
+
+              <Field label="WhatsApp" required error={errors.phone} htmlFor="enr-phone" hint="Te avisaremos aquí cuando se confirme tu pago">
+                <div className="relative">
+                  <span className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 font-mono text-xs font-bold pointer-events-none">+591</span>
+                  <Input
+                    id="enr-phone"
+                    type="tel"
+                    inputMode="numeric"
+                    autoComplete="tel-national"
+                    value={phone}
+                    onChange={(e) => {
+                      setPhone(localPhone(e.target.value));
+                      clearErr('phone');
+                    }}
+                    error={errors.phone}
+                    className="pl-14"
                     placeholder="76249155"
                   />
                 </div>
-                {errors.phone && (
-                  <p className="text-[11px] text-red-600 font-bold mt-1 flex items-center gap-1">
-                    <AlertCircle className="w-3 h-3" /> {errors.phone}
-                  </p>
-                )}
+              </Field>
+            </div>
+
+            {/* Ubicación */}
+            <div className="bg-gradient-to-br from-sky-50 to-blue-50 rounded-3xl border border-sky-100 p-4 sm:p-5 space-y-4">
+              <SectionTitle icon={MapPin} title="Ciudad, sub-directiva y regional" />
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <Field label="Ciudad" required htmlFor="enr-city">
+                  <Select
+                    id="enr-city"
+                    value={cityId}
+                    onChange={(e) => {
+                      locationTouched.current = true;
+                      setCityId(e.target.value);
+                      clearErr('regional');
+                    }}
+                  >
+                    {catalogs.cities.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+                <Field label="Sub-directiva" required htmlFor="enr-sub">
+                  <Select
+                    id="enr-sub"
+                    value={subId}
+                    onChange={(e) => {
+                      locationTouched.current = true;
+                      setSubId(e.target.value);
+                      clearErr('regional');
+                    }}
+                  >
+                    {subsForCity.length === 0 && <option value="">Sin sub-directivas</option>}
+                    {subsForCity.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+                <Field label="Regional" required error={errors.regional} htmlFor="enr-regional">
+                  <Select
+                    id="enr-regional"
+                    value={regionalId}
+                    onChange={(e) => {
+                      locationTouched.current = true;
+                      setRegionalId(e.target.value);
+                      clearErr('regional');
+                    }}
+                    error={errors.regional}
+                  >
+                    {regsForSub.length === 0 && <option value="">Sin regionales</option>}
+                    {regsForSub.map((r) => (
+                      <option key={r.id} value={r.id}>
+                        {r.name}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
               </div>
             </div>
 
-            {/* Regional Oficial de las 31 de Bolivia */}
-            <div className="p-4 rounded-2xl bg-sky-50 border border-sky-200 space-y-2">
-              <label className="font-extrabold text-[#0284C7] flex items-center gap-1.5 text-xs sm:text-sm">
-                <MapPin className="w-4 h-4 text-[#0284C7]" />
-                Selecciona tu Regional Oficial (31 Regionales del CJN) *
-              </label>
-              <select
-                value={regional}
-                onChange={(e) => setRegional(e.target.value as CJRRegional)}
-                className="w-full px-3.5 py-3 rounded-xl border border-sky-300 bg-white text-slate-900 font-bold text-sm focus:ring-2 focus:ring-[#0284C7]"
+            {/* Iglesia y área */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <Field label="Iglesia / congregación" htmlFor="enr-church">
+                <div className="relative">
+                  <Church className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
+                  <Input
+                    id="enr-church"
+                    value={churchCongregation}
+                    onChange={(e) => setChurchCongregation(e.target.value)}
+                    className="pl-10"
+                    placeholder="Iglesia Central UCE"
+                  />
+                </div>
+              </Field>
+              <Field label="Área de servicio" htmlFor="enr-area">
+                <Select id="enr-area" value={serviceAreaOfInterest} onChange={(e) => setServiceAreaOfInterest(e.target.value)}>
+                  {catalogs.serviceAreas.map((a) => (
+                    <option key={a.id} value={a.name}>
+                      {a.name}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+            </div>
+
+            {/* Emergencia */}
+            <div className="space-y-4">
+              <SectionTitle icon={Phone} tone="amber" title="Contacto de emergencia" subtitle="Alguien a quien llamar si lo necesitas" />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <Field label="Nombre del contacto" htmlFor="enr-emergencyName">
+                  <Input
+                    id="enr-emergencyName"
+                    value={emergencyContactName}
+                    onChange={(e) => setEmergencyContactName(e.target.value)}
+                    placeholder="ej. María Flores (mamá)"
+                  />
+                </Field>
+                <Field label="WhatsApp de emergencia" htmlFor="enr-emergencyPhone">
+                  <Input
+                    id="enr-emergencyPhone"
+                    type="tel"
+                    inputMode="numeric"
+                    value={emergencyPhone}
+                    onChange={(e) => setEmergencyPhone(e.target.value.replace(/[^\d+ ]/g, '').slice(0, 16))}
+                    placeholder="76249155"
+                  />
+                </Field>
+              </div>
+            </div>
+
+            {/* Cuenta nueva (solo sin sesión) */}
+            {!isAuthenticated && (
+              <div className="rounded-3xl border border-violet-100 bg-gradient-to-br from-violet-50/80 to-white p-4 sm:p-5 space-y-4">
+                <SectionTitle
+                  icon={KeyRound}
+                  tone="violet"
+                  title="Tu cuenta"
+                  subtitle="Con ella entras a «Mi campamento» para elegir talleres, campeonatos y ver tu credencial"
+                />
+
+                {emailExists && (
+                  <div
+                    id="enr-email-exists"
+                    tabIndex={-1}
+                    role="alert"
+                    className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 flex flex-col sm:flex-row sm:items-center gap-3 outline-none animate-fade-in"
+                  >
+                    <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0" />
+                    <p className="flex-1 text-xs text-amber-900 leading-relaxed">
+                      <strong className="block">Ya existe una cuenta con {accountEmail.trim() || 'este correo'}.</strong>
+                      Inicia sesión y continúa con tu inscripción: lo que escribiste se mantiene.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => requireLogin('login')}
+                      className="self-start sm:self-auto inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-xs font-black cursor-pointer"
+                    >
+                      <LogIn className="w-3.5 h-3.5" /> Iniciar sesión
+                    </button>
+                  </div>
+                )}
+
+                <Field label="Correo electrónico" required error={errors.email} htmlFor="enr-email">
+                  <div className="relative">
+                    <Mail className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <Input
+                      id="enr-email"
+                      type="email"
+                      autoComplete="email"
+                      value={accountEmail}
+                      onChange={(e) => {
+                        setAccountEmail(e.target.value);
+                        setEmailExists(false);
+                        clearErr('email');
+                      }}
+                      error={errors.email}
+                      className="pl-10"
+                      placeholder="tucorreo@ejemplo.com"
+                    />
+                  </div>
+                </Field>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <Field label="Contraseña" required error={errors.password} htmlFor="enr-password">
+                    <PasswordInput
+                      id="enr-password"
+                      autoComplete="new-password"
+                      value={password}
+                      invalid={!!errors.password}
+                      onChange={(e) => {
+                        setPassword(e.target.value);
+                        clearErr('password');
+                      }}
+                      placeholder="Mínimo 8 caracteres"
+                    />
+                  </Field>
+                  <Field label="Confirmar contraseña" required error={errors.confirmPassword} htmlFor="enr-confirmPassword">
+                    <PasswordInput
+                      id="enr-confirmPassword"
+                      autoComplete="new-password"
+                      value={confirmPassword}
+                      invalid={!!errors.confirmPassword}
+                      onChange={(e) => {
+                        setConfirmPassword(e.target.value);
+                        clearErr('confirmPassword');
+                      }}
+                      placeholder="Repite tu contraseña"
+                    />
+                  </Field>
+                </div>
+                {(password || errors.password) && (
+                  <PasswordChecklist password={password} email={accountEmail} confirm={confirmPassword} showConfirm />
+                )}
+
+                <div className="space-y-1">
+                  <label
+                    htmlFor="enr-acceptTerms"
+                    className={`flex items-start gap-3 p-3 rounded-2xl border cursor-pointer transition-colors ${
+                      errors.acceptTerms ? 'border-red-300 bg-red-50/50' : acceptTerms ? 'border-emerald-200 bg-emerald-50/60' : 'border-slate-200 bg-white'
+                    }`}
+                  >
+                    <input
+                      id="enr-acceptTerms"
+                      type="checkbox"
+                      checked={acceptTerms}
+                      onChange={(e) => {
+                        setAcceptTerms(e.target.checked);
+                        clearErr('acceptTerms');
+                      }}
+                      className="mt-0.5 w-4 h-4 accent-sky-600 cursor-pointer shrink-0"
+                    />
+                    <span className="text-xs text-slate-700 leading-relaxed">
+                      Acepto los términos del campamento y el uso de mis datos por el Comité Juvenil para organizar mi inscripción y
+                      comunicarme novedades.
+                    </span>
+                  </label>
+                  {errors.acceptTerms && (
+                    <p className="text-[11px] text-red-600 font-semibold flex items-center gap-1">
+                      <AlertCircle className="w-3 h-3 shrink-0" /> {errors.acceptTerms}
+                    </p>
+                  )}
+                </div>
+
+                <p className="text-xs text-slate-500 text-center">
+                  ¿Ya tienes cuenta?{' '}
+                  <button type="button" onClick={() => requireLogin('login')} className="font-black text-[#0284C7] hover:underline cursor-pointer">
+                    Inicia sesión
+                  </button>
+                </p>
+              </div>
+            )}
+
+            <div className="flex flex-col-reverse sm:flex-row sm:items-center justify-between gap-3 pt-4 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => goTo(1)}
+                className="w-full sm:w-auto px-5 py-3 rounded-2xl text-sm font-bold text-slate-600 hover:bg-slate-100 cursor-pointer inline-flex items-center justify-center gap-1.5"
               >
-                {CJR_REGIONALES.map((reg, idx) => (
-                  <option key={reg} value={reg}>
-                    {idx + 1}. {reg}
-                  </option>
-                ))}
-              </select>
+                <ArrowLeft className="w-4 h-4" /> Volver
+              </button>
+              <button
+                type="button"
+                disabled={!!existingReg}
+                onClick={() => validateData() && goTo(3)}
+                className="w-full sm:w-auto px-8 py-4 bg-gradient-to-r from-sky-500 to-blue-600 text-white font-black text-sm rounded-2xl shadow-lg flex items-center justify-center gap-2 active:scale-95 cursor-pointer disabled:from-slate-200 disabled:to-slate-200 disabled:text-slate-400 disabled:shadow-none disabled:cursor-not-allowed"
+              >
+                Ir al pago <ArrowRight className="w-4 h-4" />
+              </button>
             </div>
+          </StepCard>
+        )}
 
-            {/* Congregación / Iglesia Local */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div>
-                <label className="font-bold text-slate-800 flex items-center gap-1 mb-1">
-                  <Church className="w-3.5 h-3.5 text-slate-500" />
-                  Iglesia Local / Congregación
-                </label>
-                <input
-                  type="text"
-                  value={churchCongregation}
-                  onChange={(e) => setChurchCongregation(e.target.value)}
-                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:ring-2 focus:ring-[#0284C7] text-sm text-slate-900"
-                  placeholder="Ej. Iglesia Central UCE Potosí"
-                />
-              </div>
-
-              <div>
-                <label className="font-bold text-slate-800 block mb-1">
-                  Correo Electrónico (Opcional)
-                </label>
-                <input
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:ring-2 focus:ring-[#0284C7] text-sm text-slate-900"
-                  placeholder="carlos.condori@cjn.bo"
-                />
-              </div>
+        {/* ── PASO 3: PAGO ───────────────────────────────── */}
+        {step === 3 && camp && !paymentSettings && (
+          <div className="mt-4 bg-white rounded-3xl shadow-xl border border-slate-100 p-5 sm:p-8 space-y-4 animate-pulse" aria-busy="true">
+            <div className="h-6 w-40 rounded-lg bg-slate-200" />
+            <div className="h-24 rounded-2xl bg-slate-100" />
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              {[0, 1, 2].map((i) => (
+                <div key={i} className="h-28 rounded-2xl bg-slate-100" />
+              ))}
             </div>
+            <p className="text-xs text-slate-400 text-center">Cargando métodos de pago…</p>
+          </div>
+        )}
 
+        {step === 3 && camp && paymentSettings && (
+          <div className="space-y-4 animate-fade-in-scale mt-4">
+            <StepCard title="Paso 3: Pago" subtitle={`Total a pagar: ${totalToPay} Bs`} icon={CreditCard} gradient="from-emerald-500 to-teal-600" onBack={() => goTo(2)}>
+              {buyerBanner}
 
-            {/* ================= SECCIÓN CRÍTICA: ¿ERES DELEGADO? HABILITACIÓN DE COMPETENCIAS ================= */}
-            <div className="p-5 rounded-2xl bg-gradient-to-br from-indigo-50/70 via-white to-sky-50 border-2 border-indigo-200 shadow-xs space-y-4">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-xl bg-indigo-600 text-white flex items-center justify-center shrink-0 shadow-xs">
-                    <Trophy className="w-5 h-5 text-amber-300" />
-                  </div>
-                  <div>
-                    <h3 className="text-sm sm:text-base font-extrabold text-slate-900">
-                      ¿Eres Delegado(a) Oficial de tu Iglesia o Regional?
-                    </h3>
-                    <p className="text-[11px] text-slate-600">
-                      Si eres delegado, se te habilitará la selección de competencias en las que participará tu delegación.
-                    </p>
-                  </div>
+              {/* Resumen */}
+              <div className="rounded-2xl bg-slate-50 border border-slate-100 p-4 space-y-2 text-sm">
+                <div className="flex justify-between gap-3">
+                  <span className="text-slate-600 min-w-0 truncate">{camp.name}</span>
+                  <span className="font-mono font-bold shrink-0">{regularFee} Bs</span>
                 </div>
-
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setIsDelegate(false)}
-                    className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${
-                      !isDelegate
-                        ? 'bg-slate-800 text-white shadow-xs'
-                        : 'bg-white border border-slate-300 text-slate-600 hover:bg-slate-50'
-                    }`}
-                  >
-                    No, Campamentista
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setIsDelegate(true)}
-                    className={`px-4 py-2 rounded-xl text-xs font-black transition-all cursor-pointer flex items-center gap-1.5 ${
-                      isDelegate
-                        ? 'bg-indigo-600 text-white shadow-md ring-2 ring-indigo-300'
-                        : 'bg-white border border-indigo-300 text-indigo-700 hover:bg-indigo-50'
-                    }`}
-                  >
-                    <Check className="w-3.5 h-3.5" />
-                    <span>Sí, Soy Delegado</span>
+                <div className="flex justify-between gap-3 text-xs text-slate-500">
+                  <span className="min-w-0 truncate">
+                    {`${firstName} ${paternalLastName}`.trim()} · {gender === 'M' ? 'Varón' : gender === 'F' ? 'Mujer' : ''} · {regionalName}
+                  </span>
+                  <button type="button" onClick={() => goTo(2)} className="shrink-0 font-bold text-[#0284C7] hover:underline cursor-pointer">
+                    Editar
                   </button>
                 </div>
-              </div>
-
-              {/* LISTA DE COMPETENCIAS QUE SE HABILITAN AL ELEGIR DELEGADO */}
-              {isDelegate && (
-                <div className="pt-3 border-t border-indigo-100 space-y-3 animate-fade-in">
-                  <div className="bg-amber-50/80 border border-amber-300 rounded-xl p-3 flex items-start gap-2.5">
-                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                    <div className="text-xs text-amber-900 leading-relaxed">
-                      <strong className="block font-black">Regla Oficial de Competencias y Olimpiadas:</strong>
-                      Selecciona a continuación las disciplinas en las que participará tu delegación. 
-                      <span className="font-black text-indigo-900 block mt-0.5">
-                        ⚠️ En el sistema, la inscripción formal y acreditación de los equipos SE HABILITA AUTOMÁTICAMENTE TRAS CONFIRMAR EL PAGO.
-                      </span>
-                    </div>
+                {!isAuthenticated && (
+                  <div className="flex justify-between gap-3 text-xs text-violet-700">
+                    <span className="inline-flex items-center gap-1 min-w-0">
+                      <KeyRound className="w-3.5 h-3.5 shrink-0" />
+                      <span className="truncate">Cuenta nueva: {accountEmail.trim()}</span>
+                    </span>
+                    <span className="font-bold shrink-0">Gratis</span>
                   </div>
-
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
-                    {INITIAL_CHAMPIONSHIPS.map((champ) => {
-                      const isSelected = selectedChampionshipIds.includes(champ.id);
-                      return (
-                        <div
-                          key={champ.id}
-                          onClick={() => toggleChampionshipSelection(champ.id)}
-                          className={`p-3 rounded-xl border text-left cursor-pointer transition-all flex items-start gap-3 ${
-                            isSelected
-                              ? 'bg-indigo-50/90 border-indigo-500 ring-1 ring-indigo-300'
-                              : 'bg-white border-slate-200 hover:border-slate-300'
-                          }`}
-                        >
-                          <div className="mt-0.5 text-indigo-600">
-                            {isSelected ? (
-                              <CheckSquare className="w-5 h-5 text-indigo-600" />
-                            ) : (
-                              <Square className="w-5 h-5 text-slate-300" />
-                            )}
-                          </div>
-                          <div className="min-w-0 flex-1">
-                            <span className="font-extrabold text-xs text-slate-900 block truncate">
-                              {champ.sport}
-                            </span>
-                            <span className="text-[11px] text-slate-500 block truncate">
-                              {champ.genderCategory} · {champ.schedule}
-                            </span>
-                            <span className="text-[10px] font-bold text-indigo-700 bg-indigo-100/70 px-1.5 py-0.5 rounded-md inline-block mt-1">
-                              {isSelected ? '✓ Inscripción pendiente de pago' : 'Clic para inscribir equipo'}
-                            </span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-
-                  <div className="text-[11px] text-slate-500 text-right">
-                    Disciplinas seleccionadas por el delegado: <strong>{selectedChampionshipIds.length}</strong>
-                  </div>
-                </div>
-              )}
-            </div>
-
-
-            {/* SECCIÓN PRINCIPAL: VALIDACIÓN DE CUPÓN DE DELEGACIÓN EN REGISTRO */}
-            <div className="p-4 sm:p-5 rounded-2xl bg-gradient-to-br from-sky-50/90 via-white to-amber-50/50 border border-sky-200 shadow-xs space-y-3">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2 border-b border-sky-100">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 rounded-xl bg-[#0284C7] text-white flex items-center justify-center shrink-0 shadow-xs">
-                    <Tag className="w-4 h-4" />
-                  </div>
-                  <div>
-                    <h3 className="text-xs sm:text-sm font-extrabold text-slate-900">
-                      Cupón de Descuento de Delegación (Validar antes de continuar)
-                    </h3>
-                    <p className="text-[11px] text-slate-500">
-                      Válido para delegaciones oficiales de 35 jóvenes inscritos con pago por QR Simple (360 Bs).
-                    </p>
-                  </div>
-                </div>
-
-                {couponStatus.applied ? (
-                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-black bg-emerald-100 text-emerald-800 border border-emerald-300">
-                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                    Cupón Validado
-                  </span>
-                ) : (
-                  <span className="text-[11px] font-bold text-slate-500 bg-slate-100 px-2.5 py-0.5 rounded-full">
-                    Opcional
-                  </span>
                 )}
+                {paymentMethod !== 'cash_box' && couponStatus.applied && (
+                  <div className="flex justify-between text-xs text-emerald-700 font-bold">
+                    <span>Cupón {couponCodeInput}</span>
+                    <span>−{regularFee - couponFee} Bs</span>
+                  </div>
+                )}
+                <div className="flex justify-between pt-2 border-t border-slate-200 font-black">
+                  <span>Total</span>
+                  <span className="font-mono text-sky-700 text-lg">{totalToPay} Bs</span>
+                </div>
+                <p className="text-[11px] text-slate-500 flex items-start gap-1.5 pt-1">
+                  <Info className="w-3.5 h-3.5 shrink-0 mt-px text-violet-500" />
+                  Talleres incluidos: los eliges después de confirmar tu pago. Los campeonatos pueden tener un costo extra.
+                </p>
               </div>
 
-              {/* Formulario de Cupón */}
-              <div className="space-y-3 pt-1">
-                <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end">
-                  <div className="sm:col-span-7">
-                    <label className="text-xs font-bold text-slate-700 block mb-1">
-                      Código de Cupón de Delegación
-                    </label>
-                    <div className="relative">
-                      <input
-                        type="text"
-                        placeholder="Ej. GRUPO35-POTOSI o GRUPO35-NACIONAL"
-                        value={couponCodeInput}
-                        onChange={(e) => {
-                          setCouponCodeInput(e.target.value.toUpperCase());
-                          if (couponStatus.applied || couponStatus.error) {
-                            setCouponStatus({ applied: false, error: undefined });
-                          }
-                        }}
-                        className={`w-full px-3.5 py-2.5 rounded-xl border bg-white font-mono uppercase text-xs sm:text-sm font-bold tracking-wider ${
-                          couponStatus.applied
-                            ? 'border-emerald-500 bg-emerald-50/30 text-emerald-900 ring-2 ring-emerald-200'
-                            : couponStatus.error
-                            ? 'border-red-400 bg-red-50/30 text-red-900 ring-2 ring-red-200'
-                            : 'border-slate-300 focus:ring-2 focus:ring-[#0284C7] text-slate-900'
-                        }`}
-                      />
-                      {couponStatus.applied && (
-                        <span className="absolute right-3 top-1/2 -translate-y-1/2 text-emerald-600">
-                          <Check className="w-4 h-4 stroke-[3]" />
-                        </span>
-                      )}
-                    </div>
+              {/* Cupón */}
+              {camp.groupPrice !== undefined && (
+                <div className="rounded-2xl border border-amber-200 bg-amber-50/60 p-4 space-y-2">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                    <Tag className="w-4 h-4 text-amber-600" />
+                    <h3 className="text-sm font-black text-amber-900">Cupón de delegación</h3>
+                    <span className="text-[10px] text-amber-700">({camp.groupPrice} Bs por persona · grupos de 35)</span>
                   </div>
-
-                  <div className="sm:col-span-5 flex gap-2">
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      aria-label="Código de cupón"
+                      value={couponCodeInput}
+                      onChange={(e) => {
+                        setCouponCodeInput(e.target.value.toUpperCase());
+                        if (couponStatus.applied || couponStatus.error) setCouponStatus({ applied: false });
+                      }}
+                      placeholder="GRUPO35-NACIONAL"
+                      className={`flex-1 min-w-0 px-4 py-2.5 rounded-xl border font-mono text-sm font-bold uppercase outline-none ${
+                        couponStatus.applied
+                          ? 'border-emerald-400 bg-emerald-50 text-emerald-900'
+                          : couponStatus.error
+                          ? 'border-red-300 bg-red-50 text-red-900'
+                          : 'border-amber-200 bg-white'
+                      }`}
+                    />
                     <button
                       type="button"
                       onClick={() => handleApplyCoupon()}
-                      className="flex-1 px-4 py-2.5 bg-[#0284C7] hover:bg-[#0369A1] text-white font-black text-xs rounded-xl shadow-xs flex items-center justify-center gap-1.5 cursor-pointer transition-all active:scale-95 min-h-[42px]"
+                      disabled={couponLoading}
+                      className="px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-black text-xs rounded-xl cursor-pointer inline-flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-wait"
                     >
-                      <Sparkles className="w-3.5 h-3.5 text-amber-300" />
-                      <span>Validar Cupón</span>
+                      {couponLoading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                      {couponLoading ? 'Validando…' : 'Validar'}
                     </button>
-
                     {couponStatus.applied && (
                       <button
                         type="button"
-                        onClick={handleRemoveCoupon}
-                        className="px-3 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-xl cursor-pointer transition-colors min-h-[42px]"
-                        title="Quitar cupón"
+                        aria-label="Quitar cupón"
+                        onClick={() => setCouponStatus({ applied: false })}
+                        className="px-3 rounded-xl bg-white border border-slate-200 cursor-pointer"
                       >
-                        <X className="w-4 h-4" />
+                        <X className="w-4 h-4 text-slate-500" />
                       </button>
                     )}
                   </div>
+                  <div className="flex flex-wrap gap-1.5 text-[10px]">
+                    <span className="text-amber-700 font-semibold self-center">Probar:</span>
+                    {['GRUPO35-NACIONAL', 'GRUPO35-POTOSI'].map((code) => (
+                      <button
+                        key={code}
+                        type="button"
+                        onClick={() => handleApplyCoupon(code)}
+                        disabled={couponLoading}
+                        className="disabled:opacity-50 px-2 py-1 rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-800 font-mono font-bold cursor-pointer"
+                      >
+                        {code}
+                      </button>
+                    ))}
+                  </div>
+                  {couponStatus.applied && (
+                    <p className="text-xs text-emerald-700 font-bold flex items-center gap-1">
+                      <CheckCircle2 className="w-4 h-4 shrink-0" /> ¡Cupón aplicado! Pagas {couponFee} Bs en lugar de {regularFee} Bs.
+                      {paymentMethod === 'cash_box' && ' (No aplica en efectivo)'}
+                    </p>
+                  )}
+                  {couponStatus.error && <p className="text-xs text-red-700">{couponStatus.error}</p>}
                 </div>
+              )}
 
-                {/* Botones de sugerencias rápidas de cupones válidos */}
-                <div className="flex flex-wrap items-center gap-1.5 pt-1 text-[11px]">
-                  <span className="text-slate-500 font-semibold">Probar cupones oficiales:</span>
-                  <button
-                    type="button"
-                    onClick={() => handleApplyCoupon('GRUPO35-NACIONAL')}
-                    className="px-2 py-0.5 rounded-lg bg-sky-100 hover:bg-sky-200 text-sky-800 font-mono font-bold cursor-pointer transition-colors"
-                  >
-                    GRUPO35-NACIONAL
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleApplyCoupon('GRUPO35-POTOSI')}
-                    className="px-2 py-0.5 rounded-lg bg-sky-100 hover:bg-sky-200 text-sky-800 font-mono font-bold cursor-pointer transition-colors"
-                  >
-                    GRUPO35-POTOSI
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleApplyCoupon('GRUPO35-COCHABAMBA')}
-                    className="px-2 py-0.5 rounded-lg bg-sky-100 hover:bg-sky-200 text-sky-800 font-mono font-bold cursor-pointer transition-colors"
-                  >
-                    GRUPO35-COCHABAMBA
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleApplyCoupon('GRUPO35-SANTACRUZ')}
-                    className="px-2 py-0.5 rounded-lg bg-sky-100 hover:bg-sky-200 text-sky-800 font-mono font-bold cursor-pointer transition-colors"
-                  >
-                    GRUPO35-SANTACRUZ
-                  </button>
+              {/* Métodos */}
+              <div className="space-y-2">
+                <div className={`grid grid-cols-1 gap-3 ${methodOptions.length === 3 ? 'sm:grid-cols-3' : 'sm:grid-cols-2'}`}>
+                  {methodOptions.length === 0 && (
+                    <p className="sm:col-span-3 text-sm text-red-700 bg-red-50 border border-red-100 rounded-2xl p-4">
+                      No hay métodos de pago habilitados. Comunícate con la organización.
+                    </p>
+                  )}
+                  {methodOptions.map(({ id, cfg }) => {
+                    const Icon = METHOD_STYLE[id].icon;
+                    const isActive = paymentMethod === id;
+                    return (
+                      <button
+                        key={id}
+                        type="button"
+                        aria-pressed={isActive}
+                        onClick={() => {
+                          setPaymentMethod(id);
+                          clearErr('paymentMethod', 'voucher', 'reference');
+                          setSubmitError('');
+                        }}
+                        className={`payment-card p-4 rounded-2xl border-2 text-left cursor-pointer ${
+                          isActive ? 'border-sky-400 bg-sky-50 shadow-lg ring-2 ring-sky-100' : 'border-slate-200 bg-white hover:shadow-md'
+                        }`}
+                      >
+                        <div className={`w-10 h-10 rounded-2xl bg-gradient-to-br ${METHOD_STYLE[id].gradient} flex items-center justify-center mb-3 shadow-md`}>
+                          <Icon className="w-5 h-5 text-white" />
+                        </div>
+                        <div className="font-black text-sm text-slate-900">{cfg.label}</div>
+                        <div className="text-[11px] text-slate-500 mt-0.5">{cfg.description}</div>
+                      </button>
+                    );
+                  })}
                 </div>
+                {errors.paymentMethod && (
+                  <p className="text-[11px] text-red-600 font-semibold flex items-center gap-1">
+                    <AlertCircle className="w-3 h-3 shrink-0" /> {errors.paymentMethod}
+                  </p>
+                )}
+              </div>
+            </StepCard>
 
-                {/* Estado de validación del cupón */}
-                {couponStatus.applied && (
-                  <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-300 text-emerald-900 space-y-1 animate-fade-in">
-                    <div className="flex items-center gap-2 font-black text-xs">
-                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                      <span>¡CUPÓN VALIDADO! Descuento habilitado para tu inscripción</span>
-                    </div>
-                    <div className="text-[11px] text-emerald-800 pl-6 leading-relaxed">
-                      Tu tarifa base se reduce de <strong>450 Bs</strong> a <strong className="text-emerald-950 font-mono text-xs">360 Bs</strong> (Ahorras <strong>90 Bs</strong>). 
-                      <span className="block mt-0.5 text-emerald-700 italic">
-                        * Recuerda que el descuento aplica al realizar tu pago previo mediante transferencia o QR Simple.
+            {paymentMethod === 'qr_bank' && (
+              <div className="bg-white rounded-3xl shadow-xl border border-slate-100 p-5 sm:p-8 animate-fade-in-scale space-y-5">
+                <div className="text-center space-y-1">
+                  <h3 className="text-lg font-black text-slate-900 font-display">Escanea el código QR</h3>
+                  <p className="text-sm text-slate-500">Usa la app de tu banco para pagar {totalToPay} Bs</p>
+                  <p className="text-xs text-slate-400">{paymentSettings.qr.bankName}</p>
+                </div>
+                <div className="flex justify-center">
+                  <div className={`relative p-4 rounded-3xl border-4 shadow-2xl ${webhookReceived ? 'border-emerald-400' : 'border-sky-200 animate-pulse-glow'}`}>
+                    {paymentSettings.qr.qrImageUrl || paymentQrDataUrl ? (
+                      <img
+                        src={paymentSettings.qr.qrImageUrl || paymentQrDataUrl}
+                        alt="Código QR de pago"
+                        className="w-48 h-48 sm:w-56 sm:h-56 rounded-2xl"
+                      />
+                    ) : (
+                      <div className="w-48 h-48 sm:w-56 sm:h-56 bg-slate-100 rounded-2xl flex items-center justify-center">
+                        <RefreshCw className="w-8 h-8 text-slate-400 animate-spin" />
+                      </div>
+                    )}
+                    {webhookReceived && (
+                      <div className="absolute -top-3 -right-3 w-10 h-10 bg-emerald-500 rounded-2xl flex items-center justify-center shadow-lg animate-pop-in">
+                        <Check className="w-6 h-6 text-white" />
+                      </div>
+                    )}
+                  </div>
+                </div>
+                {paymentSettings.qr.instructions && (
+                  <p className="text-xs text-slate-600 text-center max-w-md mx-auto">{paymentSettings.qr.instructions}</p>
+                )}
+                {qrManual ? (
+                  <div className="space-y-3 pt-2 border-t border-slate-100">
+                    <h4 className="text-sm font-black text-slate-900">Sube tu comprobante del pago QR</h4>
+                    {voucherBlock}
+                  </div>
+                ) : !webhookReceived ? (
+                  <div className="bg-sky-50 rounded-2xl p-4 text-center space-y-2 border border-sky-100">
+                    <p className="text-sm font-bold text-sky-800 flex items-center justify-center gap-2">
+                      <span className="relative flex h-2.5 w-2.5">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-sky-400 opacity-75" />
+                        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-sky-500" />
                       </span>
-                    </div>
+                      Esperando confirmación bancaria…
+                    </p>
+                    <button type="button" onClick={simulateWebhook} className="text-xs text-sky-600 hover:text-sky-800 underline font-semibold cursor-pointer">
+                      Simular pago (demo)
+                    </button>
                   </div>
-                )}
-
-                {couponStatus.error && (
-                  <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-800 text-xs font-medium flex items-start gap-2 animate-fade-in">
-                    <AlertTriangle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
-                    <div>
-                      <span className="font-bold block">No se pudo aplicar el cupón:</span>
-                      <span className="text-[11px] text-red-700">{couponStatus.error}</span>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-
-          </div>
-
-          {/* Barra de Tarifa y Botón de Validación de Datos */}
-          <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-4 pt-3">
-            <div>
-              <span className="text-xs text-slate-500 font-semibold block">Tarifa Campamento (Paso 1):</span>
-              <div className="flex items-center gap-2">
-                <span className="text-2xl font-black font-mono text-[#0284C7]">
-                  {couponStatus.applied ? (couponStatus.discountedPrice || 360) : STANDARD_BASE_CAMP_FEE} Bs
-                </span>
-                {couponStatus.applied ? (
-                  <span className="text-xs font-bold text-emerald-700 bg-emerald-100 px-2.5 py-0.5 rounded-full border border-emerald-300">
-                    Cupón Validado (-90 Bs)
-                  </span>
                 ) : (
-                  <span className="text-xs text-slate-500">
-                    Tarifa Oficial Regular
-                  </span>
+                  webhookPayloadData && (
+                    <div className="bg-emerald-50 rounded-2xl p-4 border border-emerald-200 space-y-2 animate-fade-in-scale">
+                      <div className="flex items-center gap-2 font-black text-emerald-800 text-sm">
+                        <CheckCircle2 className="w-5 h-5 text-emerald-600" /> ¡Pago confirmado por el banco!
+                      </div>
+                      <div className="grid grid-cols-2 gap-2 text-xs text-emerald-700">
+                        <div>
+                          <span className="font-bold block">Monto</span>
+                          {webhookPayloadData.monto} Bs
+                        </div>
+                        <div>
+                          <span className="font-bold block">Transacción</span>
+                          <span className="font-mono">{webhookPayloadData.transaccionId}</span>
+                        </div>
+                      </div>
+                    </div>
+                  )
                 )}
               </div>
-            </div>
+            )}
 
-            <button
-              type="button"
-              onClick={() => {
-                if (couponCodeInput.trim() && !couponStatus.applied && !couponStatus.error) {
-                  handleApplyCoupon();
-                }
-                if (validateStep1()) {
-                  setStep(2);
-                  window.scrollTo({ top: 80, behavior: 'smooth' });
-                }
-              }}
-              className="w-full sm:w-auto px-7 py-3.5 bg-[#0284C7] hover:bg-[#0369A1] text-white font-black text-sm rounded-2xl shadow-md flex items-center justify-center gap-2 cursor-pointer transition-all active:scale-95 min-h-[48px]"
-            >
-              <span>Validar Datos y Elegir Talleres</span>
-              <ArrowRight className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* ================= PASO 2: ELEGIR TALLERES (SIN PRECIO INDIVIDUAL - PRECIO FIJO) ================= */}
-      {step === 2 && (
-        <div className="bg-white rounded-3xl p-5 sm:p-8 shadow-xl border border-sky-100 mt-6 space-y-6 animate-fade-in">
-          <div className="flex items-center justify-between pb-3 border-b border-slate-100">
-            <div>
-              <div className="flex items-center gap-2">
-                <BookOpen className="w-5 h-5 text-[#0284C7]" />
-                <h2 className="text-base sm:text-lg font-bold text-slate-900 font-display">
-                  Paso 2: Elige los Talleres que más te gusten
-                </h2>
+            {paymentMethod === 'transfer' && (
+              <div className="bg-white rounded-3xl shadow-xl border border-slate-100 p-5 sm:p-8 animate-fade-in-scale space-y-5">
+                <div className="text-center space-y-1">
+                  <h3 className="text-lg font-black text-slate-900 font-display">Datos de la cuenta oficial</h3>
+                  <p className="text-sm text-slate-500">Transfiere {totalToPay} Bs y sube tu comprobante</p>
+                </div>
+                {activeAccounts.length === 0 && (
+                  <p className="text-sm text-amber-800 bg-amber-50 border border-amber-100 rounded-2xl p-4">
+                    Aún no hay cuentas bancarias publicadas. Comunícate al {paymentSettings.whatsappContact}.
+                  </p>
+                )}
+                <div className={`grid gap-3 ${activeAccounts.length > 1 ? 'md:grid-cols-2' : ''}`}>
+                  {activeAccounts.map((acc) => (
+                    <div key={acc.id} className="bg-indigo-50 rounded-2xl border border-indigo-100 p-4 space-y-2.5">
+                      <div className="flex items-center gap-2 text-sm font-black text-indigo-900">
+                        <Building2 className="w-4 h-4 text-indigo-500" /> {acc.bank}
+                      </div>
+                      {[
+                        { label: 'Número de cuenta', value: acc.accountNumber, mono: true },
+                        { label: 'Titular', value: acc.holder },
+                        ...(acc.holderDocument ? [{ label: 'CI / NIT', value: acc.holderDocument, mono: true }] : []),
+                        { label: 'Tipo', value: `${acc.accountType} · ${acc.currency}` },
+                        { label: 'Glosa', value: `CJN-${camp.id.toUpperCase()}`, mono: true },
+                      ].map((item) => (
+                        <div key={item.label} className="flex items-center justify-between gap-3">
+                          <div className="min-w-0">
+                            <span className="text-[10px] text-indigo-500 font-bold uppercase">{item.label}</span>
+                            <p className={`text-sm font-bold text-indigo-900 break-all ${item.mono ? 'font-mono' : ''}`}>{item.value}</p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => copyToClipboard(item.value, `${acc.id}-${item.label}`)}
+                            className="shrink-0 p-2 rounded-xl bg-white hover:bg-indigo-100 border border-indigo-100 cursor-pointer"
+                            title="Copiar"
+                            aria-label={`Copiar ${item.label.toLowerCase()}`}
+                          >
+                            {copiedField === `${acc.id}-${item.label}` ? (
+                              <Check className="w-4 h-4 text-emerald-600" />
+                            ) : (
+                              <Copy className="w-4 h-4 text-indigo-500" />
+                            )}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+                {paymentSettings.transfer.instructions && <p className="text-xs text-slate-600">{paymentSettings.transfer.instructions}</p>}
+                {voucherBlock}
+                <p className="text-xs text-amber-800 bg-amber-50 border border-amber-100 rounded-xl p-3">
+                  Revisaremos tu comprobante en un máximo de {paymentSettings.transfer.verificationHours} horas. Tu credencial se genera
+                  ahora; tus talleres y campeonatos se habilitan cuando tesorería apruebe el pago.
+                </p>
               </div>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Lunes a Viernes · 08:30 a 10:30 (Todos los talleres están 100% INCLUIDOS · Precio Fijo)
-              </p>
-            </div>
+            )}
+
+            {paymentMethod === 'cash_box' && (
+              <div className="bg-white rounded-3xl shadow-xl border border-slate-100 p-5 sm:p-8 animate-fade-in-scale space-y-4">
+                <div className={`grid gap-3 ${cashAdvanceAmount > 0 ? 'grid-cols-2' : 'grid-cols-1'}`}>
+                  {cashAdvanceAmount > 0 && (
+                    <div className="p-4 rounded-2xl bg-amber-50 border border-amber-100 text-center">
+                      <Banknote className="w-6 h-6 text-amber-600 mx-auto" />
+                      <div className="text-2xl font-black font-mono text-amber-700 mt-1">{cashAdvanceAmount} Bs</div>
+                      <div className="text-xs text-amber-700 font-bold">Adelanto ({camp.cashAdvancePercent}%)</div>
+                    </div>
+                  )}
+                  <div className="p-4 rounded-2xl bg-slate-50 border border-slate-100 text-center">
+                    <Wallet className="w-6 h-6 text-slate-500 mx-auto" />
+                    <div className="text-2xl font-black font-mono text-slate-700 mt-1">{cashRemainingAmount} Bs</div>
+                    <div className="text-xs text-slate-600 font-bold">{cashAdvanceAmount > 0 ? 'Resto al llegar' : 'Total a pagar en caja'}</div>
+                  </div>
+                </div>
+                <ul className="space-y-1.5 text-xs text-slate-600">
+                  <li>• El pago en efectivo no aplica cupones ni descuentos ({regularFee} Bs).</li>
+                  <li>• Dónde pagar: {paymentSettings.cash.places}.</li>
+                  {paymentSettings.cash.instructions && <li>• {paymentSettings.cash.instructions}</li>}
+                  <li>• Tus talleres y campeonatos se habilitan cuando caja registre tu pago.</li>
+                </ul>
+              </div>
+            )}
+
+            {submitError && (
+              <div role="alert" className="p-4 rounded-2xl bg-red-50 border border-red-200 flex items-start gap-2.5 text-sm text-red-800 animate-fade-in">
+                <AlertTriangle className="w-5 h-5 text-red-500 shrink-0" />
+                <div className="flex-1">
+                  <strong className="block">No pudimos completar tu inscripción</strong>
+                  {submitError}
+                </div>
+                <button type="button" onClick={() => setSubmitError('')} aria-label="Cerrar aviso" className="p-1 rounded-lg hover:bg-red-100 cursor-pointer">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            )}
 
             <button
               type="button"
-              onClick={() => setStep(1)}
-              className="text-xs font-bold text-slate-500 hover:text-slate-800 flex items-center gap-1 cursor-pointer"
+              onClick={handleCompleteRegistration}
+              disabled={!canProceedPayment() || isSubmitting || !!existingReg}
+              aria-busy={isSubmitting}
+              className={`w-full py-4 px-4 text-sm font-black rounded-3xl shadow-xl flex items-center justify-center gap-2 transition-all active:scale-95 cursor-pointer ${
+                isSubmitting
+                  ? 'bg-gradient-to-r from-emerald-500 to-teal-600 text-white opacity-80 cursor-wait'
+                  : canProceedPayment() && !existingReg
+                  ? 'bg-gradient-to-r from-emerald-500 to-teal-600 text-white animate-pulse-glow-green'
+                  : 'bg-slate-200 text-slate-400 cursor-not-allowed'
+              }`}
             >
-              <ArrowLeft className="w-3.5 h-3.5" /> Volver a Mis Datos
+              {isSubmitting ? <Loader2 className="w-5 h-5 animate-spin" /> : <ShieldCheck className="w-5 h-5" />}
+              {isSubmitting
+                ? isAuthenticated
+                  ? 'Registrando tu inscripción…'
+                  : 'Creando tu cuenta e inscripción…'
+                : paymentMethod === 'qr_bank' && !qrManual && !webhookReceived
+                ? 'Esperando confirmación de pago…'
+                : isAuthenticated
+                ? 'Completar inscripción'
+                : 'Crear mi cuenta y completar inscripción'}
             </button>
+            {!canProceedPayment() && needsVoucher && !isSubmitting && (
+              <p className="text-center text-[11px] text-slate-500 -mt-2">
+                {voucherRequired && !transferVoucherFile ? 'Sube tu comprobante para continuar.' : 'Ingresa el número de referencia para continuar.'}
+              </p>
+            )}
           </div>
+        )}
 
-          {/* Banner de Precio Fijo: Los Talleres no tienen costo extra */}
-          <div className="p-3.5 rounded-2xl bg-emerald-50 border border-emerald-200 flex items-center justify-between gap-3 text-xs">
-            <div className="flex items-center gap-2 text-emerald-900">
-              <Sparkles className="w-4 h-4 text-emerald-600 shrink-0" />
-              <span>
-                <strong>Talleres 100% Incluidos:</strong> No tienen precio adicional (0 Bs). Puedes elegir el taller o talleres que prefieras dentro de la tarifa fija de tu inscripción.
-              </span>
+        {/* ── PASO 4: ¡LISTO! ────────────────────────────── */}
+        {step === 4 && completedCamper && (
+          <div className="mt-4 space-y-6 animate-pop-in">
+            <div className="text-center space-y-2">
+              <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-emerald-100 text-emerald-800 text-xs font-black">
+                <Sparkles className="w-4 h-4" /> ¡Inscripción completada!
+              </div>
+              <h2 className="text-2xl sm:text-3xl font-black text-slate-900 font-display">
+                Bienvenido/a a tu tribu, {completedCamper.firstName} <Flame className="inline w-7 h-7 text-orange-500 -mt-1" />
+              </h2>
+              <p className="text-sm text-slate-500 max-w-md mx-auto">
+                Tu credencial quedó guardada en <strong>Mis inscripciones</strong>. Preséntala (impresa o en tu celular) al llegar.
+              </p>
+              {createdAccountEmail && (
+                <p className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-violet-50 border border-violet-100 text-xs text-violet-800 font-semibold">
+                  <KeyRound className="w-3.5 h-3.5" /> Tu cuenta quedó creada: <span className="font-black break-all">{createdAccountEmail}</span>
+                </p>
+              )}
             </div>
-            <span className="font-mono font-black text-xs bg-emerald-600 text-white px-2.5 py-1 rounded-lg shrink-0">
-              0 Bs Adicional
-            </span>
-          </div>
 
-          {/* Grid de los 6 Talleres Oficiales */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {courses.map((course) => {
-              const isSelected = selectedCourseIds.includes(course.id);
-              const spotsLeft = Math.max(0, course.maxCapacity - course.enrolledCount);
-              const isFull = spotsLeft <= 0;
-
+            {(() => {
+              const paid = completedCamper.payment.status === 'completed';
               return (
                 <div
-                  key={course.id}
-                  onClick={() => !isFull && toggleCourseSelection(course.id)}
-                  className={`p-4 rounded-2xl border-2 transition-all cursor-pointer flex flex-col justify-between ${
-                    isSelected
-                      ? 'border-[#0284C7] bg-sky-50/70 shadow-sm ring-1 ring-sky-300'
-                      : isFull
-                      ? 'border-slate-200 bg-slate-50 opacity-60 cursor-not-allowed'
-                      : 'border-slate-200 bg-white hover:border-sky-300 hover:bg-slate-50/50'
+                  className={`rounded-3xl p-5 sm:p-6 border space-y-4 ${
+                    paid ? 'bg-gradient-to-br from-violet-600 to-indigo-700 border-violet-500 text-white' : 'bg-white border-amber-200'
                   }`}
                 >
-                  <div className="space-y-3">
-                    {/* Facilitador Header */}
-                    <div className="flex items-center gap-3">
-                      <img
-                        src={course.instructorPhotoUrl}
-                        alt={course.instructor}
-                        className="w-12 h-12 rounded-full object-cover border-2 border-[#0284C7] shadow-xs shrink-0"
-                        onError={(e) => {
-                          e.currentTarget.style.display = 'none';
-                        }}
-                      />
-                      <div className="min-w-0">
-                        <span className="text-xs font-extrabold text-slate-900 block truncate">
-                          {course.instructor}
-                        </span>
-                        <span className="text-[11px] text-[#0284C7] font-bold block truncate">
-                          {course.instructorRole}
-                        </span>
-                        <span className="text-[10px] text-slate-500 block truncate">
-                          {course.location}
-                        </span>
-                      </div>
-                    </div>
-
-                    {/* Titulo y Descripción */}
-                    <div>
-                      <h4 className="text-xs sm:text-sm font-black text-slate-900 leading-snug">
-                        {course.title}
-                      </h4>
-                      <p className="text-[11px] text-slate-600 line-clamp-2 mt-1 leading-relaxed">
-                        {course.description}
+                  <div className="flex items-start gap-3">
+                    <span
+                      className={`w-11 h-11 rounded-2xl flex items-center justify-center shrink-0 ${
+                        paid ? 'bg-white/20 text-white' : 'bg-amber-100 text-amber-600'
+                      }`}
+                    >
+                      {paid ? <Sparkles className="w-5 h-5" /> : <Hourglass className="w-5 h-5" />}
+                    </span>
+                    <div className="min-w-0">
+                      <h3 className={`text-base font-black font-display ${paid ? 'text-white' : 'text-slate-900'}`}>
+                        {paid ? '¡Tu pago está confirmado! Ya puedes elegir' : 'Tus talleres y campeonatos se desbloquean al confirmar tu pago'}
+                      </h3>
+                      <p className={`text-xs mt-1 leading-relaxed ${paid ? 'text-violet-100' : 'text-slate-600'}`}>
+                        {paid
+                          ? 'Entra a «Mi campamento» para inscribirte a tus talleres (dentro del horario de inscripción de cada uno) y a los campeonatos.'
+                          : completedCamper.payment.status === 'pending_cash'
+                          ? 'Cuando pagues en caja, entra a «Mi campamento» para elegir tus talleres y campeonatos.'
+                          : 'Tesorería revisará tu comprobante. Te avisaremos cuando esté aprobado y podrás elegir tus talleres y campeonatos desde «Mi campamento».'}
                       </p>
                     </div>
                   </div>
-
-                  {/* Pie de Taller */}
-                  <div className="pt-3 border-t border-slate-100 mt-3 flex items-center justify-between text-xs">
-                    <span className={`font-mono font-bold text-[11px] px-2.5 py-0.5 rounded-full ${
-                      isFull ? 'bg-red-100 text-red-700' : 'bg-emerald-100 text-emerald-800'
-                    }`}>
-                      {isFull ? 'Cupo Lleno' : `${spotsLeft} cupos libres`}
-                    </span>
-
-                    <div className={`px-3 py-1 rounded-xl text-xs font-black flex items-center gap-1.5 ${
-                      isSelected 
-                        ? 'bg-[#0284C7] text-white shadow-xs' 
-                        : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                    }`}>
-                      {isSelected ? (
-                        <>
-                          <Check className="w-3.5 h-3.5 stroke-[3]" />
-                          <span>Elegido (Incluido)</span>
-                        </>
-                      ) : (
-                        <span>Seleccionar</span>
-                      )}
-                    </div>
-                  </div>
+                  <button
+                    type="button"
+                    onClick={() => goToMyCamp(completedCamper)}
+                    className={`w-full py-4 rounded-2xl font-black text-sm shadow-lg flex items-center justify-center gap-2 active:scale-95 cursor-pointer ${
+                      paid ? 'bg-white text-violet-700 hover:bg-violet-50' : 'bg-gradient-to-r from-violet-600 to-indigo-600 text-white'
+                    }`}
+                  >
+                    <BookOpen className="w-4 h-4" /> Elegir mis talleres y campeonatos <ArrowRight className="w-4 h-4" />
+                  </button>
                 </div>
               );
-            })}
-          </div>
+            })()}
 
-          {/* Estado de Cupón de Delegación en Paso 2 */}
-          <div className="p-4 rounded-2xl bg-sky-50/70 border border-sky-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
-            <div className="flex items-center gap-2.5">
-              <div className="w-8 h-8 rounded-xl bg-[#0284C7] text-white flex items-center justify-center shrink-0">
-                <Tag className="w-4 h-4" />
-              </div>
-              <div>
-                {couponStatus.applied ? (
-                  <>
-                    <span className="font-extrabold text-slate-900 block text-xs sm:text-sm">
-                      Cupón Validado en tu Registro: <span className="font-mono text-[#0284C7] bg-white px-2 py-0.5 rounded-md border border-sky-300">{couponCodeInput}</span>
-                    </span>
-                    <span className="text-[11px] text-emerald-700 font-bold block mt-0.5">
-                      ✓ Descuento de delegación aplicado: 360 Bs (Ahorro de 90 Bs en pago anticipado QR)
-                    </span>
-                  </>
-                ) : (
-                  <>
-                    <span className="font-bold text-slate-800 block">
-                      Tarifa Estándar Fija de Campamento: 450 Bs
-                    </span>
-                    <span className="text-[11px] text-slate-500 block">
-                      Sin cupón de delegación de 35 personas. Los talleres no tienen precio adicional.
-                    </span>
-                  </>
-                )}
-              </div>
+            <div className="rounded-[32px] bg-slate-100 p-4 sm:p-8">
+              <Credential camper={completedCamper} />
             </div>
 
-            {couponStatus.applied ? (
-              <div className="flex items-center gap-2">
-                <span className="px-3 py-1 bg-emerald-100 text-emerald-800 font-bold rounded-xl text-xs border border-emerald-300 shrink-0">
-                  Descuento Activo
-                </span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setStep(1);
-                    window.scrollTo({ top: 500, behavior: 'smooth' });
-                  }}
-                  className="text-[11px] text-slate-500 hover:text-slate-800 underline font-semibold cursor-pointer"
-                >
-                  Cambiar en Paso 1
-                </button>
-              </div>
-            ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
               <button
                 type="button"
-                onClick={() => {
-                  setStep(1);
-                  window.scrollTo({ top: 500, behavior: 'smooth' });
-                }}
-                className="px-3.5 py-2 bg-white hover:bg-slate-100 text-[#0284C7] border border-sky-300 rounded-xl font-bold text-xs cursor-pointer shrink-0 transition-colors shadow-xs"
+                onClick={() => setSelectedCamperForBadge(completedCamper)}
+                className="py-3.5 rounded-2xl bg-[#0284C7] text-white font-black text-sm shadow flex items-center justify-center gap-2 cursor-pointer"
               >
-                Ingresar Cupón en Registro
+                <QrCode className="w-4 h-4" /> Abrir credencial
               </button>
-            )}
-          </div>
-
-          {/* Resumen Total y Botón */}
-          <div className="p-4 rounded-2xl bg-sky-50 border border-sky-200 flex flex-col sm:flex-row items-center justify-between gap-4">
-            <div>
-              <span className="text-xs text-slate-500 block">Tarifa Fija Única (Talleres Incluidos):</span>
-              <div className="text-2xl font-black text-[#0284C7] font-mono">
-                {finalTotalAmount} Bs
-              </div>
-            </div>
-
-            <button
-              type="button"
-              onClick={() => {
-                setStep(3);
-                window.scrollTo({ top: 80, behavior: 'smooth' });
-              }}
-              className="w-full sm:w-auto px-7 py-3.5 bg-[#0284C7] hover:bg-[#0369A1] text-white font-black text-sm rounded-2xl shadow-md flex items-center justify-center gap-2 cursor-pointer transition-all active:scale-95 min-h-[48px]"
-            >
-              <span>Continuar al Pago y Acreditación</span>
-              <ArrowRight className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* ================= PASO 3: PAGO QR CON WEBHOOK EN TIEMPO REAL O EFECTIVO CON ADELANTO ================= */}
-      {step === 3 && (
-        <div className="bg-white rounded-3xl p-5 sm:p-8 shadow-xl border border-sky-100 mt-6 space-y-6 animate-fade-in">
-          <div className="flex items-center justify-between pb-3 border-b border-slate-100">
-            <div className="flex items-center gap-2">
-              <CreditCard className="w-5 h-5 text-[#0284C7]" />
-              <h2 className="text-base sm:text-lg font-bold text-slate-900 font-display">
-                Paso 3: Método de Pago y Validación en Tiempo Real
-              </h2>
-            </div>
-            <button
-              type="button"
-              onClick={() => setStep(2)}
-              className="text-xs font-bold text-slate-500 hover:text-slate-800 flex items-center gap-1 cursor-pointer"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" /> Cambiar talleres
-            </button>
-          </div>
-
-          {/* Selector de Método de Pago */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <button
-              type="button"
-              onClick={() => setPaymentOption('qr_bank')}
-              className={`p-4 rounded-2xl border-2 text-left transition-all cursor-pointer flex items-center gap-3 ${
-                paymentOption === 'qr_bank'
-                  ? 'border-[#0284C7] bg-sky-50/80 ring-2 ring-sky-300'
-                  : 'border-slate-200 bg-white hover:bg-slate-50'
-              }`}
-            >
-              <div className="w-10 h-10 rounded-xl bg-[#0284C7] text-white flex items-center justify-center shrink-0">
-                <QrCode className="w-5 h-5" />
-              </div>
-              <div>
-                <span className="text-xs sm:text-sm font-bold text-slate-900 block">
-                  Pago por QR Simple (Webhook en Tiempo Real)
-                </span>
-                <span className="text-[11px] text-[#0284C7] font-semibold block">
-                  Sin subir fotos · Conciliación automática instantánea
-                </span>
-              </div>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setPaymentOption('cash_box')}
-              className={`p-4 rounded-2xl border-2 text-left transition-all cursor-pointer flex items-center gap-3 ${
-                paymentOption === 'cash_box'
-                  ? 'border-amber-500 bg-amber-50/80 ring-2 ring-amber-300'
-                  : 'border-slate-200 bg-white hover:bg-slate-50'
-              }`}
-            >
-              <div className="w-10 h-10 rounded-xl bg-amber-500 text-white flex items-center justify-center shrink-0">
-                <Banknote className="w-5 h-5" />
-              </div>
-              <div>
-                <span className="text-xs sm:text-sm font-bold text-slate-900 block">
-                  Pago en Efectivo (Caja en Sede con Adelanto)
-                </span>
-                <span className="text-[11px] text-amber-800 font-semibold block">
-                  Sin descuento · Competencias se activan al liquidar
-                </span>
-              </div>
-            </button>
-          </div>
-
-          {/* ================= VISTA A: PAGO CON QR Y WEBHOOK BANCARIO EN TIEMPO REAL ================= */}
-          {paymentOption === 'qr_bank' ? (
-            <div className="space-y-6">
-              
-              {/* Tarjeta del QR Oficial */}
-              <div className="p-5 sm:p-6 rounded-3xl bg-slate-50 border border-slate-200 flex flex-col md:flex-row items-center justify-between gap-6">
-                <div className="text-center md:text-left space-y-2">
-                  <span className="text-[11px] font-black uppercase text-[#0284C7] tracking-wider">
-                    QR Oficial de Pago Bancario
-                  </span>
-                  <h3 className="text-lg sm:text-xl font-black text-slate-900 font-display">
-                    Escanea desde cualquier banca móvil
-                  </h3>
-                  <div className="text-xs text-slate-600 max-w-sm">
-                    <span>Monto a transferir: </span>
-                    <strong className="text-lg text-[#0284C7] font-mono">{finalTotalAmount} Bs</strong>
-                    {couponStatus.applied && (
-                      <span className="block text-[11px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-md mt-1">
-                        ✓ Descuento de Delegación ({couponCodeInput}): 360 Bs (-90 Bs ahorro)
-                      </span>
-                    )}
-                  </div>
-                  <div className="text-[11px] text-slate-500 space-y-0.5 pt-1">
-                    <div>Banco: <strong>Banco Nacional de Bolivia (BNB)</strong></div>
-                    <div>Cuenta Corriente: <strong>150-1289301-CJN</strong></div>
-                    <div>Titular: <strong>Comité Juvenil Nacional · UCE Bolivia</strong></div>
-                  </div>
-                </div>
-
-                <div className="flex flex-col items-center gap-2 shrink-0">
-                  <div className="p-3 bg-white rounded-2xl shadow-md border border-slate-200">
-                    {paymentQrDataUrl ? (
-                      <img src={paymentQrDataUrl} alt="QR Pago" className="w-40 h-40 rounded-lg" />
-                    ) : (
-                      <div className="w-40 h-40 bg-slate-100 flex items-center justify-center text-xs text-slate-400">
-                        Generando QR...
-                      </div>
-                    )}
-                  </div>
-                  <span className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">
-                    QR Simple Interbancario
-                  </span>
-                </div>
-              </div>
-
-              {/* SECCIÓN CRÍTICA: WEBHOOK EN TIEMPO REAL (SIN SUBIR COMPROBANTES) */}
-              <div className={`p-5 sm:p-6 rounded-3xl border-2 shadow-sm space-y-4 transition-all ${
-                webhookReceived 
-                  ? 'bg-emerald-50/70 border-emerald-300' 
-                  : 'bg-gradient-to-r from-sky-50 via-white to-sky-50 border-sky-300'
-              }`}>
-                <div className="flex items-center justify-between pb-3 border-b border-sky-200">
-                  <div className="flex items-center gap-2.5">
-                    <div className={`w-9 h-9 rounded-xl flex items-center justify-center ${
-                      webhookReceived ? 'bg-emerald-600 text-white' : 'bg-[#0284C7] text-white'
-                    }`}>
-                      {webhookReceived ? <CheckCircle2 className="w-5 h-5" /> : <Radio className="w-5 h-5 animate-pulse" />}
-                    </div>
-                    <div>
-                      <h4 className="text-sm sm:text-base font-extrabold text-slate-900 font-display">
-                        {webhookReceived ? '¡Pago Acreditado en Tiempo Real por Webhook!' : 'Pasarela Bancaria con Webhook en Tiempo Real'}
-                      </h4>
-                      <p className="text-[11px] text-slate-500">
-                        {webhookReceived
-                          ? 'El banco notificó la transferencia exitosa. Tu ingreso y tus competencias están habilitados.'
-                          : 'No necesitas subir fotos ni comprobantes. El sistema escucha el webhook del banco y valida al instante.'}
-                      </p>
-                    </div>
-                  </div>
-
-                  {webhookReceived ? (
-                    <span className="px-3 py-1 bg-emerald-600 text-white font-mono text-xs font-bold rounded-full shadow-xs">
-                      200 OK · CONCILIADO
-                    </span>
-                  ) : (
-                    <div className="flex items-center gap-1.5 px-3 py-1 bg-sky-100 text-[#0284C7] font-bold text-xs rounded-full">
-                      <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping"></span>
-                      <span>Escuchando Webhook...</span>
-                    </div>
-                  )}
-                </div>
-
-                {/* Si no ha recibido el webhook todavía: Radar y botón para simulación inmediata */}
-                {!webhookReceived ? (
-                  <div className="space-y-4 pt-1">
-                    <div className="p-4 rounded-2xl bg-white border border-sky-100 flex flex-col sm:flex-row items-center justify-between gap-4">
-                      <div className="flex items-center gap-3">
-                        <div className="relative flex h-3 w-3">
-                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-sky-400 opacity-75"></span>
-                          <span className="relative inline-flex rounded-full h-3 w-3 bg-[#0284C7]"></span>
-                        </div>
-                        <div className="text-xs text-slate-700">
-                          <strong className="block text-slate-900">Esperando confirmación interbancaria automática...</strong>
-                          <span>El webhook conciliará automáticamente tu pago en cuanto realices la transferencia.</span>
-                        </div>
-                      </div>
-
-                      <button
-                        type="button"
-                        onClick={() => triggerBankingWebhook(true)}
-                        className="w-full sm:w-auto px-5 py-2.5 bg-[#0284C7] hover:bg-[#0369A1] text-white font-black text-xs rounded-xl shadow-md flex items-center justify-center gap-1.5 transition-all cursor-pointer active:scale-95 shrink-0"
-                      >
-                        <Zap className="w-4 h-4 text-amber-300" />
-                        <span>Simular Webhook Bancario Inmediato</span>
-                      </button>
-                    </div>
-                    <p className="text-[11px] text-slate-400 text-center">
-                      * Modo Prototipo: El webhook se dispara automáticamente en pocos segundos o puedes pulsar el botón para probarlo al instante.
-                    </p>
-                  </div>
-                ) : (
-                  /* Webhook Recibido con Éxito */
-                  <div className="space-y-3 pt-1 animate-fade-in">
-                    <div className="p-4 bg-white rounded-2xl border border-emerald-200 text-xs space-y-2">
-                      <div className="flex items-center justify-between border-b border-emerald-100 pb-2">
-                        <span className="font-bold text-emerald-900">Comprobante de Notificación Webhook:</span>
-                        <span className="font-mono text-emerald-800 font-bold">{webhookPayloadData?.authCode}</span>
-                      </div>
-                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] text-slate-600">
-                        <div>
-                          <span className="text-slate-400 block">Banco Emisor:</span>
-                          <strong className="text-slate-800">BNB / QR Simple</strong>
-                        </div>
-                        <div>
-                          <span className="text-slate-400 block">Monto Acreditado:</span>
-                          <strong className="text-emerald-700 font-mono text-xs">{webhookPayloadData?.monto} Bs</strong>
-                        </div>
-                        <div>
-                          <span className="text-slate-400 block">Hora de Notificación:</span>
-                          <strong className="text-slate-800">{webhookPayloadData?.hora}</strong>
-                        </div>
-                        <div>
-                          <span className="text-slate-400 block">Estado Ingreso:</span>
-                          <strong className="text-emerald-700">AUTORIZADO</strong>
-                        </div>
-                      </div>
-                    </div>
-
-                    {isDelegate && (
-                      <div className="p-3 bg-indigo-50 border border-indigo-200 rounded-xl text-xs text-indigo-900 flex items-center gap-2">
-                        <Trophy className="w-4 h-4 text-amber-500 shrink-0" />
-                        <span>
-                          <strong>Competencias de Delegación Habilitadas:</strong> Al haberse conciliado el pago por webhook, tus <strong>{selectedChampionshipIds.length}</strong> disciplinas quedan formalmente inscritas y autorizadas en el sistema.
-                        </span>
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              {/* Botón Finalizar Inscripción (Habilitado tras Webhook) */}
-              <div className="p-5 rounded-2xl bg-slate-50 border border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-4">
-                <div>
-                  <span className="text-xs text-slate-500 block">Estado de acreditación:</span>
-                  <div className="text-sm font-black flex items-center gap-2">
-                    {webhookReceived ? (
-                      <span className="text-emerald-700 flex items-center gap-1">
-                        <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                        Pago Conciliado · Ingreso y Competencias Desbloqueados
-                      </span>
-                    ) : (
-                      <span className="text-amber-700 flex items-center gap-1">
-                        <AlertTriangle className="w-4 h-4 text-amber-600" />
-                        Esperando Webhook Bancario
-                      </span>
-                    )}
-                  </div>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={handleCompleteRegistration}
-                  disabled={!webhookReceived}
-                  className={`w-full sm:w-auto px-8 py-3.5 rounded-2xl font-black text-sm flex items-center justify-center gap-2 transition-all shadow-lg min-h-[48px] ${
-                    webhookReceived
-                      ? 'bg-[#0284C7] hover:bg-[#0369A1] text-white cursor-pointer active:scale-95'
-                      : 'bg-slate-300 text-slate-500 cursor-not-allowed'
-                  }`}
-                >
-                  <span>Finalizar y Obtener Gafete Oficial</span>
-                  <ArrowRight className="w-4 h-4" />
-                </button>
-              </div>
-
-            </div>
-          ) : (
-            /* ================= VISTA B: PAGO EN EFECTIVO ALLÁ (EN SEDE CON ADELANTO) ================= */
-            <div className="space-y-6">
-              
-              {/* Alerta Oficial de Regla de Pago en Efectivo */}
-              <div className="p-4 bg-amber-50 border-2 border-amber-300 rounded-2xl space-y-2">
-                <div className="flex items-center gap-2 text-amber-900 font-extrabold text-sm">
-                  <ShieldAlert className="w-5 h-5 text-amber-600" />
-                  <span>Regla Oficial: Pago en Efectivo en Sede</span>
-                </div>
-                <div className="text-xs text-amber-800 space-y-1 pl-7 leading-relaxed">
-                  <p>
-                    1. <strong>Sin descuento ni cupón:</strong> Al pagar en caja presencial no aplica tarifa de grupo de 360 Bs (se cobra la tarifa estándar de <strong>450 Bs</strong>).
-                  </p>
-                  <p>
-                    2. <strong>Habilitación en el Sistema:</strong> Tu ingreso al campamento y la acreditación de las competencias de delegación permanecerán <span className="underline font-bold">bloqueados</span> hasta que te acerques a la mesa de Caja en el campamento a liquidar el pago.
-                  </p>
-                </div>
-              </div>
-
-              {/* OPCIONES DE PAGO EN EFECTIVO: CON ADELANTO O EN PUERTA */}
-              <div className="p-5 rounded-2xl bg-white border border-slate-200 shadow-xs space-y-4">
-                <h4 className="text-sm font-extrabold text-slate-900">
-                  Modalidad de Pago en Sede (¿Deseas registrar un adelanto para asegurar tu cupo?):
-                </h4>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div
-                    onClick={() => setCashAdvanceOption('with_advance')}
-                    className={`p-4 rounded-xl border-2 cursor-pointer transition-all ${
-                      cashAdvanceOption === 'with_advance'
-                        ? 'border-[#0284C7] bg-sky-50/70 ring-1 ring-sky-300'
-                        : 'border-slate-200 bg-white hover:bg-slate-50'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2 mb-1">
-                      <span className="font-extrabold text-xs sm:text-sm text-slate-900">
-                        Registrar con Adelanto / Anticipo
-                      </span>
-                      <span className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-1.5 py-0.5 rounded-md">
-                        Recomendado
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-slate-500">
-                      Reserva de cupón de taller con anticipo. Saldo a pagar al llegar a Caja.
-                    </p>
-                  </div>
-
-                  <div
-                    onClick={() => setCashAdvanceOption('at_door')}
-                    className={`p-4 rounded-xl border-2 cursor-pointer transition-all ${
-                      cashAdvanceOption === 'at_door'
-                        ? 'border-amber-500 bg-amber-50/70 ring-1 ring-amber-300'
-                        : 'border-slate-200 bg-white hover:bg-slate-50'
-                    }`}
-                  >
-                    <div className="font-extrabold text-xs sm:text-sm text-slate-900 mb-1">
-                      Pago Total en Puerta (450 Bs)
-                    </div>
-                    <p className="text-[11px] text-slate-500">
-                      Cancela los 450 Bs completos en la mesa de Caja al arribar al campamento.
-                    </p>
-                  </div>
-                </div>
-
-                {/* Input de monto de adelanto si eligió with_advance */}
-                {cashAdvanceOption === 'with_advance' && (
-                  <div className="p-4 bg-sky-50/80 rounded-xl border border-sky-200 space-y-2 animate-fade-in">
-                    <label className="text-xs font-bold text-slate-800 block">
-                      Monto de Adelanto / Anticipo Registrado (en Bs):
-                    </label>
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="number"
-                        min="50"
-                        max="400"
-                        step="10"
-                        value={cashAdvanceAmount}
-                        onChange={(e) => setCashAdvanceAmount(Number(e.target.value))}
-                        className="w-32 px-3 py-2 bg-white border border-slate-300 rounded-xl font-mono font-bold text-sm text-[#0284C7]"
-                      />
-                      <span className="text-xs text-slate-600 font-semibold">
-                        Bs de adelanto
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between text-xs pt-1 border-t border-sky-200 text-slate-700">
-                      <span>Saldo pendiente a liquidar en Caja en el campamento:</span>
-                      <strong className="text-sm font-mono text-amber-900">
-                        {Math.max(0, STANDARD_BASE_CAMP_FEE - cashAdvanceAmount)} Bs
-                      </strong>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* Botón de Confirmación para Pago en Caja */}
-              <div className="p-5 rounded-2xl bg-amber-50/70 border border-amber-200 flex flex-col sm:flex-row items-center justify-between gap-4">
-                <div>
-                  <span className="text-xs text-amber-800 block">Total oficial a cancelar:</span>
-                  <div className="text-xl font-black text-amber-950 font-mono">
-                    {STANDARD_BASE_CAMP_FEE} Bs (Tarifa Puerta Sin Descuento)
-                  </div>
-                  {cashAdvanceOption === 'with_advance' && (
-                    <span className="text-[11px] text-amber-700 font-semibold block">
-                      Adelanto: {cashAdvanceAmount} Bs · Saldo en sede: {STANDARD_BASE_CAMP_FEE - cashAdvanceAmount} Bs
-                    </span>
-                  )}
-                </div>
-
-                <button
-                  type="button"
-                  onClick={handleCompleteRegistration}
-                  className="w-full sm:w-auto px-7 py-3.5 bg-amber-600 hover:bg-amber-700 text-white font-black text-sm rounded-2xl shadow-md flex items-center justify-center gap-2 cursor-pointer transition-all active:scale-95 min-h-[48px]"
-                >
-                  <span>Registrar Pre-Inscripción en Caja</span>
-                  <ArrowRight className="w-4 h-4" />
-                </button>
-              </div>
-
-            </div>
-          )}
-
-        </div>
-      )}
-
-      {/* ================= PASO 4: CREDENCIAL / GAFETE FINAL ================= */}
-      {step === 4 && completedCamper && (
-        <div className="bg-white rounded-3xl p-5 sm:p-8 shadow-xl border border-sky-100 mt-6 space-y-6 animate-fade-in text-center">
-          
-          <div className="max-w-md mx-auto space-y-3">
-            {completedCamper.payment.status === 'completed' ? (
-              <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-emerald-100 text-emerald-800 text-xs font-black uppercase tracking-wider border border-emerald-300">
-                <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                <span>Ingreso Autorizado · Conciliación Webhook QR 200 OK</span>
-              </div>
-            ) : (
-              <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-amber-100 text-amber-900 text-xs font-black uppercase tracking-wider border border-amber-300">
-                <AlertTriangle className="w-4 h-4 text-amber-600" />
-                <span>Ingreso Pendiente de Pago en Caja (Sede)</span>
-              </div>
-            )}
-
-            <h2 className="text-xl sm:text-2xl font-black text-slate-900 font-display">
-              {completedCamper.payment.status === 'completed'
-                ? '¡Inscripción Exitosa y Validada en Tiempo Real!'
-                : 'Pre-Inscripción Registrada para Pago en Caja'}
-            </h2>
-
-            <p className="text-xs sm:text-sm text-slate-600">
-              {completedCamper.payment.status === 'completed'
-                ? 'Tu pago interbancario ha sido acreditado. Tu credencial QR está lista para el control de acceso.'
-                : 'Debes pasar por la mesa de Caja al llegar al campamento para liquidar el saldo total y habilitar tu ingreso.'}
-            </p>
-          </div>
-
-          {/* Tarjeta de Resumen */}
-          <div className="max-w-lg mx-auto bg-slate-50 border border-slate-200 rounded-3xl p-5 text-left space-y-3 text-xs">
-            <div className="flex justify-between items-center pb-2 border-b border-slate-200">
-              <span className="font-bold text-slate-500">Campamentista:</span>
-              <strong className="text-slate-900 text-sm">{completedCamper.fullName}</strong>
-            </div>
-
-            <div className="flex justify-between items-center pb-2 border-b border-slate-200">
-              <span className="font-bold text-slate-500">Regional / Iglesia:</span>
-              <span className="text-slate-800 font-bold">{completedCamper.regional} · {completedCamper.churchCongregation}</span>
-            </div>
-
-            <div className="flex justify-between items-center pb-2 border-b border-slate-200">
-              <span className="font-bold text-slate-500">Rol Oficial:</span>
-              <span className={`font-mono font-bold px-2 py-0.5 rounded-md ${
-                completedCamper.isDelegate ? 'bg-indigo-100 text-indigo-900' : 'bg-sky-100 text-sky-900'
-              }`}>
-                {completedCamper.isDelegate ? '★ DELEGADO OFICIAL' : 'CAMPAMENTISTA'}
-              </span>
-            </div>
-
-
-            {/* Talleres Elegidos */}
-            <div className="pb-2 border-b border-slate-200">
-              <span className="font-bold text-slate-500 block mb-1">Talleres Seleccionados (Incluidos):</span>
-              <div className="space-y-1">
-                {completedCamper.enrolledCourseIds.map((cId: string) => {
-                  const course = courses.find((c) => c.id === cId);
-                  return (
-                    <div key={cId} className="p-2 bg-white rounded-xl border border-sky-100 text-[11px] font-bold text-slate-800 flex justify-between">
-                      <span>📖 {course?.title || cId}</span>
-                      <span className="text-emerald-700 font-mono">0 Bs (Incluido)</span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Competencias Deportivas si es Delegado */}
-            {completedCamper.isDelegate && (
-              <div className="pb-2 border-b border-slate-200">
-                <div className="flex items-center justify-between mb-1">
-                  <span className="font-bold text-indigo-900">
-                    Competencias de la Delegación:
-                  </span>
-                  <span className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded-md ${
-                    completedCamper.payment.status === 'completed'
-                      ? 'bg-emerald-100 text-emerald-800'
-                      : 'bg-amber-100 text-amber-800'
-                  }`}>
-                    {completedCamper.payment.status === 'completed'
-                      ? '✓ Habilitadas en el Sistema'
-                      : '⏳ Pendientes de Pago en Caja'}
-                  </span>
-                </div>
-
-                <div className="space-y-1">
-                  {completedCamper.enrolledChampionshipIds.length > 0 ? (
-                    completedCamper.enrolledChampionshipIds.map((chId: string) => {
-                      const champ = INITIAL_CHAMPIONSHIPS.find((c) => c.id === chId);
-                      return (
-                        <div key={chId} className="p-1.5 bg-white rounded-lg border border-indigo-100 text-[11px] text-slate-800 flex items-center gap-1.5">
-                          <Trophy className="w-3.5 h-3.5 text-amber-500 shrink-0" />
-                          <span className="font-bold">{champ?.sport || chId}</span>
-                        </div>
-                      );
-                    })
-                  ) : (
-                    <span className="text-[11px] text-slate-400 italic">No registró disciplinas adicionales.</span>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {/* Estado de Pago y Folio */}
-            <div className="flex justify-between items-center pt-1 text-xs">
-              <span className="font-bold text-slate-500">Monto & Folio:</span>
-              <div className="text-right">
-                <span className="font-black text-[#0284C7] font-mono text-sm block">
-                  {completedCamper.payment.totalAmount} Bs
-                </span>
-                <span className="font-mono text-[10px] text-slate-400">
-                  {completedCamper.payment.transactionFolio}
-                </span>
-              </div>
-            </div>
-          </div>
-
-          {/* Botones de Acción */}
-          <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-3">
-            <button
-              type="button"
-              onClick={() => setSelectedCamperForBadge(completedCamper)}
-              className="w-full sm:w-auto px-6 py-3 bg-[#0284C7] hover:bg-[#0369A1] text-white font-black text-xs rounded-xl shadow-md flex items-center justify-center gap-2 cursor-pointer transition-all active:scale-95"
-            >
-              <QrCode className="w-4 h-4" />
-              <span>Ver Gafete & Credencial QR</span>
-            </button>
-
-            {onEnrollmentComplete && (
               <button
                 type="button"
-                onClick={onEnrollmentComplete}
-                className="w-full sm:w-auto px-6 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-xl cursor-pointer transition-colors"
+                onClick={() => setActiveTab('my-registrations')}
+                className="py-3.5 rounded-2xl bg-white border border-sky-200 text-sky-700 font-black text-sm flex items-center justify-center gap-2 cursor-pointer"
               >
-                Volver al Inicio
+                <Ticket className="w-4 h-4" /> Mis inscripciones
               </button>
-            )}
+              <button
+                type="button"
+                onClick={() => onEnrollmentComplete?.()}
+                className="py-3.5 rounded-2xl text-slate-500 font-bold text-sm hover:bg-slate-100 cursor-pointer"
+              >
+                Volver al inicio
+              </button>
+            </div>
           </div>
-
-        </div>
-      )}
-
+        )}
+      </div>
     </div>
   );
 };

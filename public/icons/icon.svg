@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0EA5E9"/>
+      <stop offset="1" stop-color="#0369A1"/>
+    </linearGradient>
+    <linearGradient id="flame" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FCD34D"/>
+      <stop offset="1" stop-color="#F97316"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <g id="emblem">
+    <path d="M256 142 L224 100 M256 142 L288 100" stroke="#FFFFFF" stroke-width="16" stroke-linecap="round" fill="none"/>
+    <path d="M256 132 L428 392 L84 392 Z" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="20" stroke-linejoin="round"/>
+    <path d="M256 214 L330 392 L182 392 Z" fill="#075985"/>
+    <path d="M256 280 C276 310 298 330 292 358 C288 378 272 390 256 390 C240 390 224 378 220 358 C214 330 236 312 256 280 Z" fill="url(#flame)"/>
+    <path d="M256 330 C266 346 274 356 270 370 C268 380 262 386 256 386 C250 386 244 380 242 370 C238 356 246 346 256 330 Z" fill="#FEF3C7"/>
+    <rect x="64" y="384" width="384" height="22" rx="11" fill="#FFFFFF"/>
+  </g>
+</svg>

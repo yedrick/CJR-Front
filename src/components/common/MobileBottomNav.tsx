@@ -1,134 +1,63 @@
 import React from 'react';
 import { useCamp } from '../../context/CampContext';
 import { useAuth } from '../../context/AuthContext';
-import { 
-  Tent, 
-  BookOpen, 
-  Trophy, 
-  Image as ImageIcon, 
-  QrCode, 
-  UserPlus
-} from 'lucide-react';
+import { ViewTab } from '../../types/camp';
+import { CalendarDays, Image as ImageIcon, ShieldCheck, Tent, Ticket, UserPlus } from 'lucide-react';
+import { firstAdminTab } from '../../auth/access';
 
 export const MobileBottomNav: React.FC = () => {
-  const { activeTab, setActiveTab, registrations, setSelectedCamperForBadge } = useCamp();
-  const { currentUser } = useAuth();
+  const { activeTab, setActiveTab, myRegistrations } = useCamp();
+  const { currentUser, isStaff } = useAuth();
+  const adminHome = isStaff ? firstAdminTab(currentUser) : null;
+  const myRegs = myRegistrations;
 
-  // Find if current user has an active registration
-  const myCamperProfile = currentUser
-    ? registrations.find(
-        (r) => r.userId === currentUser.id || r.email.toLowerCase() === currentUser.email.toLowerCase()
-      )
-    : null;
+  const items: { tab: ViewTab; label: string; icon: React.ElementType; badge?: number }[] = [
+    { tab: 'catalog', label: 'Inicio', icon: Tent },
+    { tab: 'camps', label: 'Campamentos', icon: CalendarDays },
+    { tab: 'enroll', label: 'Inscribirme', icon: UserPlus },
+    { tab: 'my-registrations', label: 'Mis entradas', icon: Ticket, badge: myRegs.length },
+    adminHome
+      ? { tab: adminHome, label: 'Panel', icon: ShieldCheck }
+      : { tab: 'history', label: 'Galería', icon: ImageIcon },
+  ];
 
   return (
-    <nav 
+    <nav
       aria-label="Navegación móvil inferior"
-      className="lg:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-sky-100 shadow-2xl px-2 py-1.5 pb-safe"
+      className="lg:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-slate-100 shadow-2xl px-2 py-1.5 pb-safe no-print"
     >
-      <div className="grid grid-cols-5 items-center gap-1 max-w-md mx-auto">
-        
-        {/* Tab 1: Inicio */}
-        <button
-          type="button"
-          onClick={() => {
-            setActiveTab('catalog');
-            window.scrollTo({ top: 0, behavior: 'smooth' });
-          }}
-          className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl transition-all ${
-            activeTab === 'catalog'
-              ? 'text-[#0284C7] font-extrabold bg-sky-50'
-              : 'text-slate-600 hover:text-slate-900'
-          }`}
-        >
-          <Tent className={`w-5 h-5 ${activeTab === 'catalog' ? 'text-[#0284C7]' : 'text-slate-400'}`} />
-          <span className="text-[10px] tracking-tight mt-0.5">Inicio</span>
-        </button>
-
-        {/* Tab 2: Talleres */}
-        <button
-          type="button"
-          onClick={() => {
-            if (activeTab !== 'catalog') {
-              setActiveTab('catalog');
-            }
-            setTimeout(() => {
-              const el = document.getElementById('courses-catalog-section');
-              el?.scrollIntoView({ behavior: 'smooth' });
-            }, 50);
-          }}
-          className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl transition-all ${
-            activeTab === 'catalog'
-              ? 'text-slate-700'
-              : 'text-slate-600 hover:text-slate-900'
-          }`}
-        >
-          <BookOpen className="w-5 h-5 text-slate-400" />
-          <span className="text-[10px] tracking-tight mt-0.5">Talleres</span>
-        </button>
-
-        {/* Tab 3: Campeonatos */}
-        <button
-          type="button"
-          onClick={() => {
-            setActiveTab('championships');
-            window.scrollTo({ top: 0, behavior: 'smooth' });
-          }}
-          className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl transition-all ${
-            activeTab === 'championships'
-              ? 'text-[#0284C7] font-extrabold bg-sky-50'
-              : 'text-slate-600 hover:text-slate-900'
-          }`}
-        >
-          <Trophy className={`w-5 h-5 ${activeTab === 'championships' ? 'text-amber-500' : 'text-slate-400'}`} />
-          <span className="text-[10px] tracking-tight mt-0.5">Torneos</span>
-        </button>
-
-        {/* Tab 4: Galería / Ediciones Pasadas */}
-        <button
-          type="button"
-          onClick={() => {
-            setActiveTab('history');
-            window.scrollTo({ top: 0, behavior: 'smooth' });
-          }}
-          className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl transition-all ${
-            activeTab === 'history'
-              ? 'text-[#0284C7] font-extrabold bg-sky-50'
-              : 'text-slate-600 hover:text-slate-900'
-          }`}
-        >
-          <ImageIcon className={`w-5 h-5 ${activeTab === 'history' ? 'text-[#0284C7]' : 'text-slate-400'}`} />
-          <span className="text-[10px] tracking-tight mt-0.5">Galería</span>
-        </button>
-
-        {/* Tab 5: Inscripción / Gafete QR */}
-        {myCamperProfile ? (
-          <button
-            type="button"
-            onClick={() => setSelectedCamperForBadge(myCamperProfile)}
-            className="flex flex-col items-center justify-center py-1.5 px-1 rounded-xl text-[#0284C7] font-bold bg-sky-50 hover:bg-sky-100 transition-all border border-sky-300"
-          >
-            <QrCode className="w-5 h-5 text-[#0284C7] animate-pulse" />
-            <span className="text-[10px] tracking-tight mt-0.5">Mi Gafete</span>
-          </button>
-        ) : (
-          <button
-            type="button"
-            onClick={() => {
-              setActiveTab('enroll');
-              window.scrollTo({ top: 0, behavior: 'smooth' });
-            }}
-            className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl transition-all ${
-              activeTab === 'enroll'
-                ? 'text-[#0284C7] font-extrabold bg-sky-50'
-                : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            <UserPlus className={`w-5 h-5 ${activeTab === 'enroll' ? 'text-[#0284C7]' : 'text-slate-400'}`} />
-            <span className="text-[10px] tracking-tight mt-0.5">Inscribirme</span>
-          </button>
-        )}
-
+      <div className="grid grid-cols-5 items-end gap-1 max-w-md mx-auto">
+        {items.map(({ tab, label, icon: Icon, badge }) => {
+          const active = activeTab === tab || (label === 'Panel' && activeTab.startsWith('admin'));
+          if (tab === 'enroll') {
+            return (
+              <button key={tab} type="button" onClick={() => setActiveTab(tab)} className="flex flex-col items-center -mt-5">
+                <span className="w-12 h-12 rounded-2xl bg-gradient-to-br from-amber-400 to-orange-500 text-white flex items-center justify-center shadow-lg ring-4 ring-white">
+                  <Icon className="w-5 h-5" />
+                </span>
+                <span className={`text-[10px] mt-0.5 ${active ? 'text-orange-600 font-extrabold' : 'text-slate-600'}`}>{label}</span>
+              </button>
+            );
+          }
+          return (
+            <button
+              key={tab}
+              type="button"
+              onClick={() => setActiveTab(tab)}
+              className={`relative flex flex-col items-center justify-center py-1.5 rounded-xl transition-all ${
+                active ? 'text-[#0284C7] font-extrabold bg-sky-50' : 'text-slate-500'
+              }`}
+            >
+              <Icon className="w-5 h-5" />
+              <span className="text-[10px] tracking-tight mt-0.5 truncate max-w-full">{label}</span>
+              {!!badge && (
+                <span className="absolute top-0.5 right-2 min-w-4 h-4 px-1 rounded-full bg-[#0284C7] text-white text-[9px] font-black flex items-center justify-center">
+                  {badge}
+                </span>
+              )}
+            </button>
+          );
+        })}
       </div>
     </nav>
   );

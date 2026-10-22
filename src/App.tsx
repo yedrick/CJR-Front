@@ -3,208 +3,239 @@ import { CampProvider, useCamp } from './context/CampContext';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { Navbar } from './components/Navbar';
 import { HeroBanner } from './components/public/HeroBanner';
+import { CampsSection } from './components/public/CampsSection';
 import { CourseCatalog } from './components/public/CourseCatalog';
 import { ChampionshipsSection } from './components/public/ChampionshipsSection';
 import { PastEditionsGallery } from './components/public/PastEditionsGallery';
 import { PastCampsCarousel } from './components/public/PastCampsCarousel';
+import { MyRegistrations } from './components/public/MyRegistrations';
 import { MobileBottomNav } from './components/common/MobileBottomNav';
 import { EnrollmentWizard } from './components/public/EnrollmentWizard';
 import { AdminDashboard } from './components/admin/AdminDashboard';
+import { CampsManager } from './components/admin/CampsManager';
+import { CatalogsManager } from './components/admin/CatalogsManager';
 import { CoursesManager } from './components/admin/CoursesManager';
 import { TribesManager } from './components/admin/TribesManager';
 import { CampersRoster } from './components/admin/CampersRoster';
 import { CashierPayments } from './components/admin/CashierPayments';
 import { QRScannerView } from './components/admin/QRScannerView';
 import { ReportsExporter } from './components/admin/ReportsExporter';
+import { PaymentSettingsManager } from './components/admin/PaymentSettingsManager';
+import { AdminLayout } from './components/admin/AdminLayout';
+import { ConfirmProvider, useConfirm } from './components/common/ConfirmDialog';
 import { BadgeModal } from './components/common/BadgeModal';
 import { AuthModal } from './components/auth/AuthModal';
-import { 
-  Tent, 
-  RefreshCw, 
-  ShieldCheck, 
-  Lock, 
-  UserCheck, 
-  Sparkles 
-} from 'lucide-react';
+import { ToastProvider } from './components/common/Toast';
+import { NotFoundPage, ForbiddenPage, UnauthorizedPage, ServerErrorPage, LoadingScreen } from './components/common/StatusPages';
+import { ProfilePage } from './components/public/ProfilePage';
+import { RegistrationHub } from './components/public/RegistrationHub';
+import { TeamInvitePage } from './components/public/TeamInvitePage';
+import { ChampionshipsManager } from './components/admin/ChampionshipsManager';
+import { UsersManager } from './components/admin/UsersManager';
+import { RolesManager } from './components/admin/RolesManager';
+import { NotificationsManager } from './components/admin/NotificationsManager';
+import { ApiExplorer } from './components/admin/ApiExplorer';
+import { PwaPrompts } from './components/pwa/PwaPrompts';
+import { checkViewAccess } from './auth/access';
+import { env, isTesting } from './config/env';
+import { Tent, RefreshCw, Server } from 'lucide-react';
 
 const CampApp: React.FC = () => {
-  const { 
-    activeTab, 
-    setActiveTab, 
-    selectedCamperForBadge, 
+  const {
+    activeTab,
+    setActiveTab,
+    selectedCamperForBadge,
     setSelectedCamperForBadge,
-    resetToDemoData 
+    resetToDemoData,
+    camps,
+    catalogs,
+    tribes,
+    selectedCampId,
+    getChampionshipsForCamp,
+    isLoading,
+    dataError,
+    refreshData,
   } = useCamp();
-
-  const { currentUser, switchRole } = useAuth();
+  const { currentUser, isRestoring } = useAuth();
+  const { confirm } = useConfirm();
 
   const [preSelectedCourseId, setPreSelectedCourseId] = useState<string | undefined>(undefined);
   const [preSelectedChampId, setPreSelectedChampId] = useState<string | undefined>(undefined);
+  const [wizardKey, setWizardKey] = useState(0);
+
+  const openEnrollment = () => {
+    setWizardKey((k) => k + 1);
+    setActiveTab('enroll');
+  };
 
   const handleSelectCourseForEnrollment = (courseId: string) => {
     setPreSelectedCourseId(courseId);
-    setActiveTab('enroll');
+    openEnrollment();
   };
 
   const handleSelectChampionshipForEnrollment = (champId: string) => {
     setPreSelectedChampId(champId);
-    setActiveTab('enroll');
+    openEnrollment();
   };
 
-  // Role Security Guard for Admin Views
   const isAdminView = activeTab.startsWith('admin');
-  const hasAdminAccess = currentUser?.role === 'Administrador';
+  const access = checkViewAccess(activeTab, currentUser);
+  const hasChampionships = getChampionshipsForCamp(selectedCampId).length > 0;
+
+  // Restaurando sesión o cargando los datos iniciales de la API
+  if (isRestoring || (isLoading && !dataError)) return <LoadingScreen />;
+  // La API no respondió (500, sin conexión, etc.)
+  if (dataError && camps.length === 0) return <ServerErrorPage message={dataError} onRetry={refreshData} />;
+
+  const renderAdmin = () => (
+    <AdminLayout>
+      {activeTab === 'admin-dashboard' && <AdminDashboard />}
+      {activeTab === 'admin-camps' && <CampsManager />}
+      {activeTab === 'admin-courses' && <CoursesManager />}
+      {activeTab === 'admin-tribes' && <TribesManager />}
+      {activeTab === 'admin-roster' && <CampersRoster />}
+      {activeTab === 'admin-cashier' && <CashierPayments />}
+      {activeTab === 'admin-scanner' && <QRScannerView />}
+      {activeTab === 'admin-reports' && <ReportsExporter />}
+      {activeTab === 'admin-championships' && <ChampionshipsManager />}
+      {activeTab === 'admin-catalogs' && <CatalogsManager />}
+      {activeTab === 'admin-payment-settings' && <PaymentSettingsManager />}
+      {activeTab === 'admin-users' && <UsersManager />}
+      {activeTab === 'admin-roles' && <RolesManager />}
+      {activeTab === 'admin-notifications' && <NotificationsManager />}
+      {activeTab === 'admin-api' && <ApiExplorer />}
+    </AdminLayout>
+  );
 
   return (
-    <div className="min-h-screen flex flex-col bg-slate-50/60 text-slate-900">
-      
-      {/* Top Navbar */}
+    <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
       <Navbar />
 
-      {/* Main Content Area - Mobile responsive and clean */}
-      <main className="flex-1 pb-20 lg:pb-0 overflow-x-hidden">
-        
-        {/* LANDING PAGE (Inicio & Portada + Talleres con Facilitadores + Campeonatos Deportivos) */}
-        {activeTab === 'catalog' && (
-          <>
-            <HeroBanner />
-            <CourseCatalog onSelectCourseForEnrollment={handleSelectCourseForEnrollment} />
-            <ChampionshipsSection onSelectChampionshipForEnrollment={handleSelectChampionshipForEnrollment} />
-          </>
-        )}
-
-        {/* STANDALONE CAMPEONATOS SECTION */}
-        {activeTab === 'championships' && (
-          <div className="py-6">
-            <ChampionshipsSection onSelectChampionshipForEnrollment={handleSelectChampionshipForEnrollment} />
-          </div>
-        )}
-
-        {/* STANDALONE HISTORIAL / EDICIONES PASADAS (Carrusel + Galería Completa) */}
-        {activeTab === 'history' && (
-          <div className="py-4">
-            <PastCampsCarousel />
-            <PastEditionsGallery />
-          </div>
-        )}
-
-        {/* ENROLLMENT WIZARD */}
-        {activeTab === 'enroll' && (
-          <EnrollmentWizard
-            initialCourseId={preSelectedCourseId}
-            initialChampionshipId={preSelectedChampId}
-            onEnrollmentComplete={() => {
-              setPreSelectedCourseId(undefined);
-              setPreSelectedChampId(undefined);
-              setActiveTab('catalog');
-            }}
-          />
-        )}
-
-        {/* ADMIN VIEWS WITH ROLE & PERMISSION CHECK */}
-        {isAdminView && !hasAdminAccess ? (
-          <div className="max-w-xl mx-auto my-16 p-8 bg-white rounded-2xl border border-stone-200 shadow-md text-center space-y-4">
-            <div className="w-14 h-14 bg-red-100 text-red-700 rounded-full flex items-center justify-center mx-auto">
-              <Lock className="w-7 h-7" />
-            </div>
-            <h3 className="text-xl font-bold font-display text-stone-900">
-              Control de Seguridad: Acceso Restringido a Administradores
-            </h3>
-            <p className="text-xs text-stone-600 leading-relaxed">
-              Tu cuenta actual tiene el rol <strong>"Cliente / Campamentista"</strong> ({currentUser?.email || 'Sin sesión'}). Solo el personal con rol de <strong>"Administrador"</strong> tiene permisos para gestionar inscripciones, cobros en caja y cupos.
-            </p>
-            <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-2">
-              <button
-                type="button"
-                onClick={() => switchRole('Administrador')}
-                className="w-full sm:w-auto px-5 py-2.5 text-xs font-bold text-white bg-[#1B4332] hover:bg-[#2D6A4F] rounded-xl shadow-xs flex items-center justify-center gap-1.5"
-              >
-                <UserCheck className="w-4 h-4 text-emerald-300" />
-                <span>Cambiar a Rol Administrador</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setActiveTab('catalog')}
-                className="w-full sm:w-auto px-4 py-2.5 text-xs font-semibold text-stone-600 hover:text-stone-900 hover:bg-stone-100 rounded-xl"
-              >
-                Volver a la Página Principal
-              </button>
-            </div>
-          </div>
+      <main className="flex-1 pb-20 lg:pb-0 overflow-x-clip">
+        {access === 'unauthenticated' ? (
+          <UnauthorizedPage />
+        ) : access === 'forbidden' ? (
+          <ForbiddenPage />
+        ) : activeTab === 'not-found' ? (
+          <NotFoundPage />
+        ) : isAdminView ? (
+          renderAdmin()
         ) : (
           <>
-            {activeTab === 'admin-dashboard' && <AdminDashboard />}
-            {activeTab === 'admin-courses' && <CoursesManager />}
-            {activeTab === 'admin-tribes' && <TribesManager />}
-            {activeTab === 'admin-roster' && <CampersRoster />}
-            {activeTab === 'admin-cashier' && <CashierPayments />}
-            {activeTab === 'admin-scanner' && <QRScannerView />}
-            {activeTab === 'admin-reports' && <ReportsExporter />}
+            {activeTab === 'catalog' && (
+              <>
+                <HeroBanner />
+                <CampsSection variant="compact" />
+                <CourseCatalog onSelectCourseForEnrollment={handleSelectCourseForEnrollment} />
+                {hasChampionships && (
+                  <ChampionshipsSection onSelectChampionshipForEnrollment={handleSelectChampionshipForEnrollment} />
+                )}
+              </>
+            )}
+
+            {activeTab === 'camps' && (
+              <>
+                <CampsSection variant="full" />
+                <CourseCatalog onSelectCourseForEnrollment={handleSelectCourseForEnrollment} />
+              </>
+            )}
+
+            {activeTab === 'championships' && (
+              <div className="py-6">
+                <ChampionshipsSection onSelectChampionshipForEnrollment={handleSelectChampionshipForEnrollment} />
+              </div>
+            )}
+
+            {activeTab === 'history' && (
+              <div className="py-4">
+                <PastCampsCarousel />
+                <PastEditionsGallery />
+              </div>
+            )}
+
+            {activeTab === 'my-registrations' && <MyRegistrations />}
+
+            {activeTab === 'enroll' && (
+              <EnrollmentWizard
+                // No se remonta al iniciar sesión ni al crear la cuenta en la compra: se conservan los datos escritos
+                key={wizardKey}
+                initialCourseId={preSelectedCourseId}
+                initialChampionshipId={preSelectedChampId}
+                onEnrollmentComplete={() => {
+                  setPreSelectedCourseId(undefined);
+                  setPreSelectedChampId(undefined);
+                  setActiveTab('catalog');
+                }}
+              />
+            )}
+
+            {activeTab === 'profile' && <ProfilePage />}
+            {activeTab === 'registration-detail' && <RegistrationHub />}
+            {activeTab === 'team-invite' && <TeamInvitePage />}
           </>
         )}
       </main>
 
-      {/* Credential / Lanyard QR Badge Modal */}
-      <BadgeModal
-        camper={selectedCamperForBadge}
-        onClose={() => setSelectedCamperForBadge(null)}
-      />
-
-      {/* Authentication Modal (Login / Register / Recovery) */}
+      <BadgeModal camper={selectedCamperForBadge} onClose={() => setSelectedCamperForBadge(null)} />
       <AuthModal />
 
-      {/* Clean Footer - Celeste & Blanco CJN */}
-      <footer className="mt-auto border-t border-sky-100 bg-white text-slate-600 text-xs py-8 shadow-xs">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-4">
+      <footer className="mt-auto bg-slate-950 text-slate-400 text-xs no-print">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10 flex flex-col sm:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl bg-[#0284C7] text-white flex items-center justify-center shadow-xs">
-              <Tent className="w-5 h-5 text-sky-100" />
+            <div className="w-10 h-10 rounded-2xl bg-[#0284C7] text-white flex items-center justify-center">
+              <Tent className="w-5 h-5" />
             </div>
             <div>
-              <span className="font-extrabold text-[#0284C7] font-display text-sm block">
-                Comité Juvenil Regional (CJN) · Unión Cristiana Evangélica
+              <span className="font-extrabold text-white font-display text-sm block">
+                Comité Juvenil · Unión Cristiana Evangélica
               </span>
               <span className="text-[11px] text-slate-500">
-                Olimpiadas Bíblicas & Deportivas 2026 · 31 Regionales · Talleres en Vivo · 12 Tribus
+                {camps.filter((c) => c.status !== 'borrador').length} campamentos · {catalogs.regionales.length} regionales ·{' '}
+                {tribes.length} tribus
               </span>
             </div>
           </div>
-
-          <div className="flex items-center gap-4 text-[11px] text-slate-500">
-            <span className="flex items-center gap-1 font-semibold text-[#0284C7]">
-              <ShieldCheck className="w-3.5 h-3.5 text-[#0284C7]" />
-              Roles y Seguridad Activos
-            </span>
-            <span>·</span>
-            <button
-              onClick={() => {
-                if (confirm('¿Restablecer datos del campamento a los valores de demostración iniciales?')) {
-                  resetToDemoData();
-                  alert('Datos restablecidos con éxito.');
-                }
-              }}
-              className="inline-flex items-center gap-1 text-slate-500 hover:text-[#0284C7] transition-colors hover:underline cursor-pointer"
-            >
-              <RefreshCw className="w-3 h-3" />
-              Restablecer Datos Demo
-            </button>
+          <div className="flex flex-col sm:items-end gap-1.5">
+          <span className="inline-flex items-center gap-1.5 text-[11px] text-slate-500">
+            <Server className="w-3 h-3" />
+            {isTesting ? 'Entorno de pruebas' : 'Producción'} · {env.useMockApi ? 'API simulada' : 'API real'}
+          </span>
+          {env.useMockApi && isTesting && (
+          <button
+            onClick={async () => {
+              const ok = await confirm({
+                title: '¿Restablecer los datos de demostración?',
+                message: 'Se perderán los campamentos, inscripciones y cambios guardados en este navegador.',
+                confirmText: 'Sí, restablecer',
+                tone: 'warning',
+              });
+              if (ok) resetToDemoData();
+            }}
+            className="inline-flex items-center gap-1 text-slate-500 hover:text-sky-300 transition-colors cursor-pointer"
+          >
+            <RefreshCw className="w-3 h-3" /> Restablecer datos demo
+          </button>
+          )}
           </div>
         </div>
       </footer>
 
-      {/* Sticky Mobile Bottom Navigation Bar (Thumb-friendly for smartphones) */}
       <MobileBottomNav />
-
+      <PwaPrompts />
     </div>
   );
 };
 
 export default function App() {
   return (
-    <AuthProvider>
-      <CampProvider>
-        <CampApp />
-      </CampProvider>
-    </AuthProvider>
+    <ToastProvider>
+      <AuthProvider>
+        <CampProvider>
+          <ConfirmProvider>
+            <CampApp />
+          </ConfirmProvider>
+        </CampProvider>
+      </AuthProvider>
+    </ToastProvider>
   );
 }

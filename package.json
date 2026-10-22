@@ -1,14 +1,18 @@
 {
-  "name": "react-example",
+  "name": "cjn-campamentos",
   "private": true,
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --port=3000 --host=0.0.0.0",
-    "build": "vite build",
-    "preview": "vite preview",
-    "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "dev": "vite --mode testing --port=3000 --host=0.0.0.0",
+    "dev:prod": "vite --mode production --port=3000 --host=0.0.0.0",
+    "build": "vite build --mode production",
+    "build:testing": "vite build --mode testing",
+    "preview": "vite preview --port=4173 --host=0.0.0.0",
+    "preview:testing": "vite build --mode testing && vite preview --port=4173 --host=0.0.0.0",
+    "clean": "rm -rf dist",
+    "lint": "tsc --noEmit",
+    "docs:api": "tsx scripts/generate-api-docs.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

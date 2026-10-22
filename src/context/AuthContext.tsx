@@ -1,210 +1,228 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
-import { User, BolivianCity, Regional, UserRole } from '../types/camp';
-import { INITIAL_USERS, getRegionalByCity } from '../data/initialData';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import type { AuthTokens, User } from '../types/camp';
+import { authApi, RegisterPayload } from '../api/services';
+import { refreshSession } from '../api/http';
+import { tokenStore } from '../api/tokenStore';
+import { ApiError, errorMessage } from '../api/errors';
+import { hasPermission, Permission } from '../auth/permissions';
+import { useToast } from '../components/common/Toast';
+
+export interface AuthResult {
+  success: boolean;
+  message?: string;
+  /** errores por campo (422 / 409) */
+  errors?: Record<string, string>;
+  status?: number;
+  retryAfter?: number;
+}
+
+type AuthModalMode = 'login' | 'register' | 'recovery';
 
 interface AuthContextType {
   currentUser: User | null;
   isAuthenticated: boolean;
-  users: User[];
-  login: (emailOrPhone: string, password?: string) => { success: boolean; message?: string };
-  registerUser: (data: {
-    firstName: string;
-    paternalLastName: string;
-    maternalLastName: string;
-    birthDate: string;
-    age: number;
-    phone: string;
-    email: string;
-    city: BolivianCity;
-    password?: string;
-  }) => { success: boolean; user?: User; message?: string };
-  logout: () => void;
-  requestPasswordReset: (emailOrPhone: string) => { success: boolean; message: string };
-  switchRole: (role: UserRole) => void;
+  /** true mientras se restaura la sesión al cargar la página */
+  isRestoring: boolean;
+  /** el usuario pertenece al equipo (tiene algún permiso de administración) */
+  isStaff: boolean;
+  can: (permission: Permission | Permission[]) => boolean;
+  login: (email: string, password: string) => Promise<AuthResult>;
+  registerUser: (data: RegisterPayload) => Promise<AuthResult>;
+  logout: () => Promise<void>;
+  requestPasswordReset: (email: string) => Promise<AuthResult & { devCode?: string }>;
+  resetPassword: (email: string, code: string, newPassword: string) => Promise<AuthResult>;
+  changePassword: (currentPassword: string, newPassword: string) => Promise<AuthResult>;
+  updateProfile: (data: Partial<User>) => Promise<AuthResult>;
+  reloadUser: () => Promise<void>;
+  /** Abre la sesión con tokens recibidos de otro endpoint (p. ej. la compra en un solo paso). */
+  applySession: (user: User, tokens: AuthTokens) => void;
   isAuthModalOpen: boolean;
   setIsAuthModalOpen: (open: boolean) => void;
-  authModalMode: 'login' | 'register' | 'recovery';
-  setAuthModalMode: (mode: 'login' | 'register' | 'recovery') => void;
+  authModalMode: AuthModalMode;
+  setAuthModalMode: (mode: AuthModalMode) => void;
+  /** abre el modal de login */
+  requireLogin: (mode?: AuthModalMode) => void;
 }
-
-const STORAGE_KEY_AUTH = 'campflow_auth_user_v2';
-const STORAGE_KEY_USERS = 'campflow_all_users_v2';
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+const toResult = (e: unknown): AuthResult => {
+  if (e instanceof ApiError) {
+    return { success: false, message: e.message, errors: e.errors, status: e.status, retryAfter: e.retryAfter };
+  }
+  return { success: false, message: errorMessage(e) };
+};
+
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [users, setUsers] = useState<User[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY_USERS);
-      return saved ? JSON.parse(saved) : INITIAL_USERS;
-    } catch {
-      return INITIAL_USERS;
-    }
-  });
-
-  const [currentUser, setCurrentUser] = useState<User | null>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY_AUTH);
-      return saved ? JSON.parse(saved) : INITIAL_USERS[1]; // Logged in as cliente by default for seamless test
-    } catch {
-      return INITIAL_USERS[1];
-    }
-  });
-
+  const { toast } = useToast();
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [isRestoring, setIsRestoring] = useState(true);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
-  const [authModalMode, setAuthModalMode] = useState<'login' | 'register' | 'recovery'>('login');
+  const [authModalMode, setAuthModalMode] = useState<AuthModalMode>('login');
 
+  // Restaurar la sesión con el refresh token al cargar la app
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY_USERS, JSON.stringify(users));
-    } catch (e) {
-      console.error(e);
-    }
-  }, [users]);
-
-  useEffect(() => {
-    try {
-      if (currentUser) {
-        localStorage.setItem(STORAGE_KEY_AUTH, JSON.stringify(currentUser));
-      } else {
-        localStorage.removeItem(STORAGE_KEY_AUTH);
+    let cancelled = false;
+    (async () => {
+      try {
+        if (tokenStore.getRefresh() && (await refreshSession())) {
+          const user = await authApi.me();
+          if (!cancelled) setCurrentUser(user);
+        }
+      } catch {
+        tokenStore.clear();
+      } finally {
+        if (!cancelled) setIsRestoring(false);
       }
-    } catch (e) {
-      console.error(e);
-    }
-  }, [currentUser]);
-
-  const login = (emailOrPhone: string, _password?: string) => {
-    const clean = emailOrPhone.trim().toLowerCase();
-    const found = users.find(
-      (u) =>
-        u.email.toLowerCase() === clean ||
-        u.phone.replace(/\s+/g, '') === clean.replace(/\s+/g, '')
-    );
-
-    if (found) {
-      setCurrentUser(found);
-      setIsAuthModalOpen(false);
-      return { success: true };
-    }
-
-    return {
-      success: false,
-      message: 'No encontramos un usuario registrado con este correo o celular.',
+    })();
+    return () => {
+      cancelled = true;
     };
-  };
+  }, []);
 
-  const registerUser = (data: {
-    firstName: string;
-    paternalLastName: string;
-    maternalLastName: string;
-    birthDate: string;
-    age: number;
-    phone: string;
-    email: string;
-    city: BolivianCity;
-    password?: string;
-  }) => {
-    const existing = users.find(
-      (u) => u.email.toLowerCase() === data.email.toLowerCase() || u.phone === data.phone
-    );
-
-    if (existing) {
-      return {
-        success: false,
-        message: 'Ya existe una cuenta con este correo o número de WhatsApp.',
-      };
-    }
-
-    const regional = getRegionalByCity(data.city);
-    const now = new Date();
-    const formatted = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-
-    const newUser: User = {
-      id: `usr-${Date.now().toString().slice(-6)}`,
-      firstName: data.firstName.trim(),
-      paternalLastName: data.paternalLastName.trim(),
-      maternalLastName: data.maternalLastName.trim(),
-      birthDate: data.birthDate,
-      age: data.age,
-      phone: data.phone.trim(),
-      email: data.email.trim().toLowerCase(),
-      city: data.city,
-      regional,
-      role: 'Cliente',
-      createdAt: formatted,
+  // Si el refresh token deja de ser válido en cualquier petición → cerrar sesión
+  useEffect(() => {
+    const unsubscribe = tokenStore.onSessionLost(() => {
+      setCurrentUser((prev) => {
+        if (prev) toast({ type: 'warning', title: 'Tu sesión expiró', message: 'Vuelve a iniciar sesión para continuar.' });
+        return null;
+      });
+    });
+    return () => {
+      unsubscribe();
     };
+  }, [toast]);
 
-    setUsers((prev) => [newUser, ...prev]);
-    setCurrentUser(newUser);
-    setIsAuthModalOpen(false);
-
-    return { success: true, user: newUser };
-  };
-
-  const logout = () => {
-    setCurrentUser(null);
-  };
-
-  const requestPasswordReset = (emailOrPhone: string) => {
-    const clean = emailOrPhone.trim().toLowerCase();
-    const found = users.find(
-      (u) =>
-        u.email.toLowerCase() === clean ||
-        u.phone.replace(/\s+/g, '') === clean.replace(/\s+/g, '')
-    );
-
-    if (found) {
-      return {
-        success: true,
-        message: `Se ha enviado un enlace de recuperación con código temporal a ${found.email} y vía WhatsApp al ${found.phone}.`,
-      };
-    }
-
-    return {
-      success: false,
-      message: 'No existe una cuenta asociada a este correo o celular.',
-    };
-  };
-
-  const switchRole = (role: UserRole) => {
-    if (currentUser) {
-      const updated = { ...currentUser, role };
-      setCurrentUser(updated);
-      setUsers((prev) => prev.map((u) => (u.id === currentUser.id ? updated : u)));
-    } else {
-      // Find default user of this role
-      const match = users.find((u) => u.role === role) || users[0];
-      setCurrentUser(match);
-    }
-  };
-
-  return (
-    <AuthContext.Provider
-      value={{
-        currentUser,
-        isAuthenticated: !!currentUser,
-        users,
-        login,
-        registerUser,
-        logout,
-        requestPasswordReset,
-        switchRole,
-        isAuthModalOpen,
-        setIsAuthModalOpen,
-        authModalMode,
-        setAuthModalMode,
-      }}
-    >
-      {children}
-    </AuthContext.Provider>
+  const can = useCallback(
+    (permission: Permission | Permission[]) => hasPermission(currentUser?.permissions, permission),
+    [currentUser]
   );
+
+  const login = async (email: string, password: string): Promise<AuthResult> => {
+    try {
+      const { user, tokens } = await authApi.login(email.trim(), password);
+      applySession(user, tokens);
+      setIsAuthModalOpen(false);
+      toast({ type: 'success', title: `¡Bienvenido/a, ${user.firstName}!` });
+      return { success: true };
+    } catch (e) {
+      return toResult(e);
+    }
+  };
+
+  const registerUser = async (data: RegisterPayload): Promise<AuthResult> => {
+    try {
+      const { user, tokens } = await authApi.register(data);
+      applySession(user, tokens);
+      setIsAuthModalOpen(false);
+      toast({ type: 'success', title: 'Cuenta creada', message: 'Ya puedes inscribirte a los campamentos.' });
+      return { success: true };
+    } catch (e) {
+      return toResult(e);
+    }
+  };
+
+  const logout = async () => {
+    try {
+      if (tokenStore.getAccess() || tokenStore.getRefresh()) await authApi.logout();
+    } catch {
+      /* aunque falle la API, la sesión local se cierra */
+    }
+    tokenStore.clear();
+    setCurrentUser(null);
+    toast({ type: 'info', title: 'Sesión cerrada' });
+  };
+
+  const requestPasswordReset = async (email: string) => {
+    try {
+      const res = await authApi.forgotPassword(email);
+      return { success: true, message: res.message, devCode: res.devCode };
+    } catch (e) {
+      return toResult(e);
+    }
+  };
+
+  const resetPassword = async (email: string, code: string, newPassword: string) => {
+    try {
+      const res = await authApi.resetPassword(email, code, newPassword);
+      return { success: true, message: res.message };
+    } catch (e) {
+      return toResult(e);
+    }
+  };
+
+  const changePassword = async (currentPassword: string, newPassword: string) => {
+    try {
+      const res = await authApi.changePassword(currentPassword, newPassword);
+      return { success: true, message: res.message };
+    } catch (e) {
+      return toResult(e);
+    }
+  };
+
+  const updateProfile = async (data: Partial<User>) => {
+    try {
+      const user = await authApi.updateMe(data);
+      setCurrentUser(user);
+      return { success: true, message: 'Perfil actualizado.' };
+    } catch (e) {
+      return toResult(e);
+    }
+  };
+
+  const reloadUser = async () => {
+    try {
+      setCurrentUser(await authApi.me());
+    } catch {
+      /* el manejador de sesión perdida se encarga */
+    }
+  };
+
+  const applySession = (user: User, tokens: AuthTokens) => {
+    tokenStore.set(tokens.accessToken, tokens.refreshToken);
+    setCurrentUser(user);
+  };
+
+  const requireLogin = (mode: AuthModalMode = 'login') => {
+    setAuthModalMode(mode);
+    setIsAuthModalOpen(true);
+  };
+
+  const isStaff = !!currentUser && currentUser.role !== 'campista' && currentUser.permissions.length > 0;
+
+  // Las acciones solo usan setters, `toast` y módulos estables: el valor se recrea cuando cambia el estado.
+  const value = useMemo<AuthContextType>(
+    () => ({
+      currentUser,
+      isAuthenticated: !!currentUser,
+      isRestoring,
+      isStaff,
+      can,
+      login,
+      registerUser,
+      logout,
+      requestPasswordReset,
+      resetPassword,
+      changePassword,
+      updateProfile,
+      reloadUser,
+      applySession,
+      isAuthModalOpen,
+      setIsAuthModalOpen,
+      authModalMode,
+      setAuthModalMode,
+      requireLogin,
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [currentUser, isRestoring, isStaff, can, isAuthModalOpen, authModalMode, toast]
+  );
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 };
 
 export const useAuth = () => {
   const context = useContext(AuthContext);
-  if (!context) {
-    throw new Error('useAuth must be used within an AuthProvider');
-  }
+  if (!context) throw new Error('useAuth must be used within an AuthProvider');
   return context;
 };
+

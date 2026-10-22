@@ -33,43 +33,196 @@ h1, h2, h3, h4, .font-display {
 }
 
 @keyframes progress {
-  from {
-    width: 0%;
-  }
-  to {
-    width: 100%;
-  }
+  from { width: 0%; }
+  to { width: 100%; }
 }
 
 @keyframes fadeIn {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(24px); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes fadeInScale {
+  from { opacity: 0; transform: scale(0.95) translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes slideInRight {
+  from { opacity: 0; transform: translateX(20px); }
+  to { opacity: 1; transform: none; }
 }
 
 @keyframes floatSlow {
-  0%, 100% {
-    transform: translateY(0px);
-  }
-  50% {
-    transform: translateY(-5px);
-  }
+  0%, 100% { transform: translateY(0px); }
+  50% { transform: translateY(-8px); }
+}
+
+@keyframes floatSlow2 {
+  0%, 100% { transform: translateY(0px) rotate(0deg); }
+  50% { transform: translateY(-6px) rotate(3deg); }
+}
+
+@keyframes pulseGlow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(2, 132, 199, 0.4); }
+  50% { box-shadow: 0 0 0 12px rgba(2, 132, 199, 0); }
+}
+
+@keyframes pulseGlowAmber {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.5); }
+  50% { box-shadow: 0 0 0 10px rgba(245, 158, 11, 0); }
+}
+
+@keyframes pulseGlowGreen {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); }
+  50% { box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
+}
+
+@keyframes bounceSoft {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-4px); }
+}
+
+@keyframes popIn {
+  0% { opacity: 0; transform: scale(0.6); }
+  70% { transform: scale(1.05); }
+  100% { opacity: 1; transform: none; }
+}
+
+@keyframes checkPop {
+  0% { transform: scale(0); opacity: 0; }
+  60% { transform: scale(1.25); }
+  100% { transform: scale(1); opacity: 1; }
 }
 
 .animate-fade-in {
-  animation: fadeIn 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-fade-in-up {
+  animation: fadeInUp 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-fade-in-scale {
+  animation: fadeInScale 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-slide-in-right {
+  animation: slideInRight 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
 .animate-float {
-  animation: floatSlow 3s ease-in-out infinite;
+  animation: floatSlow 3.5s ease-in-out infinite;
+}
+
+.animate-float-2 {
+  animation: floatSlow2 4s ease-in-out infinite;
+}
+
+.animate-pulse-glow {
+  animation: pulseGlow 2s ease-in-out infinite;
+}
+
+.animate-pulse-glow-amber {
+  animation: pulseGlowAmber 2s ease-in-out infinite;
+}
+
+.animate-pulse-glow-green {
+  animation: pulseGlowGreen 2s ease-in-out infinite;
+}
+
+.animate-bounce-soft {
+  animation: bounceSoft 2s ease-in-out infinite;
+}
+
+.animate-pop-in {
+  animation: popIn 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+}
+
+.animate-check-pop {
+  animation: checkPop 0.35s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+}
+
+/* Staggered animation delays */
+.delay-100 { animation-delay: 0.1s; }
+.delay-200 { animation-delay: 0.2s; }
+.delay-300 { animation-delay: 0.3s; }
+
+/* Payment card */
+.payment-card {
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.payment-card:hover {
+  transform: translateY(-2px);
 }
 
 /* Safe area for mobile devices */
 .pb-safe {
   padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+}
+
+/* Custom range input */
+input[type="range"] {
+  accent-color: #0284C7;
+}
+
+/* Fondo de portada: zoom lento sobre las fotos de jóvenes */
+@keyframes kenBurns {
+  from { transform: scale(1.04); }
+  to { transform: scale(1.14); }
+}
+.animate-ken-burns {
+  animation: kenBurns 12s ease-out forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-ken-burns,
+  .animate-float,
+  .animate-float-2,
+  .animate-pulse-glow,
+  .animate-pulse-glow-amber,
+  .animate-pulse-glow-green {
+    animation: none;
+  }
+}
+
+/* Impresión de la credencial: solo se imprime la tarjeta, con sus colores */
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  #printable-credential,
+  #printable-credential * {
+    visibility: visible;
+  }
+  #printable-credential {
+    position: absolute;
+    left: 50%;
+    top: 0;
+    transform: translateX(-50%);
+    box-shadow: none !important;
+  }
+  .credential-notch {
+    background: #fff !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+  * {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+}
+
+/* Carruseles de chips: desplazamiento horizontal sin barra visible */
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
 }

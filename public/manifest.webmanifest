@@ -1,0 +1,45 @@
+{
+  "id": "/",
+  "name": "CJN Campamentos",
+  "short_name": "CJN",
+  "description": "Inscripciones, credenciales y avisos de los campamentos del Comité Juvenil (Unión Cristiana Evangélica).",
+  "lang": "es",
+  "dir": "ltr",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "portrait",
+  "theme_color": "#0284C7",
+  "background_color": "#F8FAFC",
+  "categories": ["education", "lifestyle", "social"],
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "/icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ],
+  "shortcuts": [
+    {
+      "name": "Mis inscripciones",
+      "short_name": "Mis entradas",
+      "description": "Ver mis inscripciones y credenciales",
+      "url": "/mis-inscripciones",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "Inscribirme",
+      "short_name": "Inscribirme",
+      "description": "Inscribirme a un campamento",
+      "url": "/inscripcion",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "Campamentos",
+      "short_name": "Campamentos",
+      "description": "Ver los campamentos del año",
+      "url": "/campamentos",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    }
+  ]
+}
